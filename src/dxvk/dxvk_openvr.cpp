@@ -263,7 +263,7 @@ namespace dxvk {
 
       // If the app has not initialized OpenVR yet, we need
       // to do it now in order to grab a compositor instance
-      g_vrFunctions.initInternal(&error, vr::VRApplication_Background);
+      g_vrFunctions.initInternal(&error, vr::VRApplication_Scene);
       m_initializedOpenVr = error == vr::VRInitError_None;
 
       if (error != vr::VRInitError_None) {
@@ -307,7 +307,7 @@ namespace dxvk {
   HMODULE VrInstance::loadLibrary() {
     HMODULE handle = nullptr;
     if (!(handle = ::GetModuleHandle("openvr_api.dll"))) {
-      handle = ::LoadLibrary("openvr_api_dxvk.dll");
+      handle = ::LoadLibrary("openvr_api.dll");
       m_loadedOvrApi = handle != nullptr;
     }
     return handle;
