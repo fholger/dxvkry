@@ -4,7 +4,7 @@
 
 #include "../com/com_include.h"
 
-namespace dxvk::sync {
+namespace dxvk { namespace sync {
 
   /**
    * \brief Recursive spinlock
@@ -29,4 +29,4 @@ namespace dxvk::sync {
     
   };
 
-}
+}}

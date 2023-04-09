@@ -2,7 +2,7 @@
 
 #include "util_string.h"
 
-namespace dxvk::env {
+namespace dxvk { namespace env {
   
 #ifdef _WIN32
   constexpr char PlatformDirSlash = '\\';
@@ -76,4 +76,4 @@ namespace dxvk::env {
    */
   bool createDirectory(const std::string& path);
   
-}
+}}

@@ -9,7 +9,7 @@
 #define VULKAN_FN(name) \
   ::PFN_ ## name name = reinterpret_cast<::PFN_ ## name>(sym(#name))
 
-namespace dxvk::vk {
+namespace dxvk { namespace vk {
 
   /**
    * \brief Vulkan library loader
@@ -428,4 +428,4 @@ namespace dxvk::vk {
     #endif
   };
   
-}
+}}

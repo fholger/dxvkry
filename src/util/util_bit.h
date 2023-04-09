@@ -35,7 +35,7 @@
 #include <type_traits>
 #include <vector>
 
-namespace dxvk::bit {
+namespace dxvk { namespace bit {
 
   template<typename T, typename J>
   T cast(const J& src) {
@@ -516,4 +516,4 @@ namespace dxvk::bit {
     uint32_t m_mask;
 
   };
-}
+}}

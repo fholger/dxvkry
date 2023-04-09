@@ -20,7 +20,7 @@
   do { } while (0)
 #endif
 
-namespace dxvk::debug {
+namespace dxvk { namespace debug {
   
   std::string methodName(const std::string& prettyName);
   
@@ -46,4 +46,4 @@ namespace dxvk::debug {
     Logger::trace(stream.str());
   }
   
-}
+}}

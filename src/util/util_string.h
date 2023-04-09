@@ -10,7 +10,7 @@
 #include "util_bit.h"
 #include "util_likely.h"
 
-namespace dxvk::str {
+namespace dxvk { namespace str {
 
   template<size_t S> struct UnicodeChar { };
   template<> struct UnicodeChar<1> { using type = uint8_t;  };
@@ -213,4 +213,4 @@ namespace dxvk::str {
     }
   }
   
-}
+}}
