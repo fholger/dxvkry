@@ -31,6 +31,18 @@
 #pragma fenv_access (on)
 #endif
 
+namespace
+{
+  IDirect3DDevice9Ex *g_createdDevice = nullptr;
+}
+
+extern "C" {
+  DLLEXPORT IDirect3DDevice9Ex* dxvkGetCreatedDevice()
+  {
+    return g_createdDevice;
+  }
+}
+
 namespace dxvk {
 
   D3D9DeviceEx::D3D9DeviceEx(
@@ -154,6 +166,8 @@ namespace dxvk {
     m_flags.set(D3D9DeviceFlag::DirtyPointScale);
 
     m_flags.set(D3D9DeviceFlag::DirtySpecializationEntries);
+
+    g_createdDevice = this;
   }
 
 

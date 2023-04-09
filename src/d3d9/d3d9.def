@@ -25,3 +25,4 @@ EXPORTS
   DXVK_UnRegisterAnnotation @28258 NONAME
 
   Direct3D9ForceHybridEnumeration @16 NONAME PRIVATE
+  dxvkGetCreatedDevice
