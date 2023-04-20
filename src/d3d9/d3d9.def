@@ -26,3 +26,7 @@ EXPORTS
 
   Direct3D9ForceHybridEnumeration @16 NONAME PRIVATE
   dxvkGetCreatedDevice
+  dxvkLockSubmissionQueue
+  dxvkReleaseSubmissionQueue
+  dxvkFillVulkanTextureInfo
+  dxvkTransitionImageLayout

@@ -11,6 +11,7 @@ d3d9_shaders = files([
 ])
 
 d3d9_src = [
+  'd3d9_dxvkry.cpp',
   'd3d9_main.cpp',
   'd3d9_interface.cpp',
   'd3d9_adapter.cpp',
