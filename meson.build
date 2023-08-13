@@ -158,7 +158,7 @@ glsl_generator = generator(
 )
 
 dxvk_version = vcs_tag(
-  command: ['git', 'describe', '--dirty=+'],
+  command: ['git', 'describe', '--dirty=-4-gplasync'],
   input:  'version.h.in',
   output: 'version.h',
 )
