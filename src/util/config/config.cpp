@@ -68,9 +68,9 @@ namespace dxvk {
       { "dxgi.deferSurfaceCreation",        "True" },
       { "d3d11.cachedDynamicResources",     "c" },
     }} },
-    /* Nioh: See Frostpunk, apparently?           */
+    /* Nioh: Apparently the same as the Atelier games  */
     { R"(\\nioh\.exe$)", {{
-      { "dxgi.deferSurfaceCreation",        "True" },
+      { "d3d9.deferSurfaceCreation",        "True" },
     }} },
     /* Quantum Break: Mever initializes shared    *
      * memory in one of its compute shaders.      *
@@ -139,6 +139,11 @@ namespace dxvk {
     { R"(\\h1(_[ms]p64_ship|-mod)\.exe$)", {{
       { "dxgi.customVendorId",              "10de" },
     }} },
+    /* Modern Warfare 2 Campaign Remastered       *
+     * AMD AGS crash same as above                */
+    { R"(\\MW2CR.exe\.exe$)", {{
+      { "dxgi.customVendorId",              "10de" },
+    }} },
     /* Crysis 3 - slower if it notices AMD card     *
      * Apitrace mode helps massively in cpu bound   *
      * game parts                                   */
@@ -167,7 +172,7 @@ namespace dxvk {
       { "d3d9.deferSurfaceCreation",        "True" },
     }} },
     /* Just how many of these games are there?    */
-    { R"(\\Atelier_(Lulua|Lydie_and_Suelle|Ryza(_2)?|Sophie_2)\.exe$)", {{
+    { R"(\\Atelier_(Lulua|Lydie_and_Suelle|Ryza(_2|_3)?|Sophie_2)\.exe$)", {{
       { "d3d9.deferSurfaceCreation",        "True" },
     }} },
     /* ...                                        */
@@ -461,20 +466,18 @@ namespace dxvk {
     { R"(\\ToEE(a)?\.exe$)", {{
       { "d3d9.allowDiscard",                "False" },
     }} },
-    /* ZUSI 3 - Aerosoft Edition                  */
-    { R"(\\ZusiSim\.exe$)", {{
-      { "d3d9.noExplicitFrontBuffer",       "True" },
-    }} },
     /* GTA IV (NVAPI)                             */
     /* Also thinks we're always on Intel          *
      * and will report/use bad amounts of VRAM.
      * Disabling support for DF texture formats
      * makes the game use a better looking render
-     * path for mirrors                           */
+     * path for mirrors.
+     * Also runs into issues after alt-tabbing.   */
     { R"(\\(GTAIV|EFLC)\.exe$)", {{
       { "d3d9.customVendorId",              "1002" },
       { "dxgi.emulateUMA",                  "True" },
       { "d3d9.supportDFFormats",            "False" },
+      { "d3d9.deviceLost",                  "True" },
     }} },
     /* Battlefield 2 (bad z-pass)                 */
     { R"(\\BF2\.exe$)", {{
@@ -539,10 +542,6 @@ namespace dxvk {
     { R"(\\SineMoraEX\.exe$)", {{
       { "d3d9.maxFrameRate",                "60" },
     }} },
-    /* Fantasy Grounds                           */
-    { R"(\\FantasyGrounds\.exe$)", {{
-      { "d3d9.noExplicitFrontBuffer",       "True" },
-    }} },
     /* Red Orchestra 2                           */
     { R"(\\ROGame\.exe$)", {{
       { "d3d9.floatEmulation",              "Strict" },
@@ -582,17 +581,6 @@ namespace dxvk {
     /* Limbo                                    */
     { R"(\\limbo\.exe$)", {{
       { "d3d9.maxFrameRate",                "60" },
-    }} },
-    /* Warhammer: Return of Reckoning Launcher
-       Forcing SM1 fixes a black window otherwise caused by
-       the lack of support for partial presentation */
-    { R"(\\RoRLauncher\.exe$)", {{
-      { "d3d9.shaderModel",                 "1" },
-    }} },
-    /* Halo CE SPV3 launcher
-       Same issue as Warhammer: RoR above       */
-    { R"(\\spv3\.exe$)", {{
-      { "d3d9.shaderModel",                 "1" },
     }} },
     /* Escape from Tarkov launcher
        Same issue as Warhammer: RoR above       */
@@ -751,6 +739,16 @@ namespace dxvk {
      * Main menu won't render after intros     */
     { R"(\\(PANZERS|PANZERS_Phase_2)\.exe$)", {{
       { "d3d9.enableDialogMode",         "True"   },
+    }} },
+    /* Dark Romance: Vampire in Love          *
+     * Works around black screen or blinking  */
+    { R"(\\(DarkRomance_VampireInLove_CE)\.exe$)", {{
+      { "d3d9.allowDirectBufferMapping", "False"   },
+    }} },
+    /* DC Universe Online                      *
+     * Freezes after alt tabbing               */
+    { R"(\\DCGAME\.EXE$)", {{
+      { "d3d9.deviceLost",              "True"   },
     }} },
     
     /**********************************************/
