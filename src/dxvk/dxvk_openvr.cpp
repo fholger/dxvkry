@@ -263,7 +263,8 @@ namespace dxvk {
 
       // If the app has not initialized OpenVR yet, we need
       // to do it now in order to grab a compositor instance
-      g_vrFunctions.initInternal(&error, vr::VRApplication_Scene);
+      bool startOpenVr = env::getEnvVar("DXVK_STARTOPENVR") == "1";
+      g_vrFunctions.initInternal(&error, startOpenVr ? vr::VRApplication_Scene : vr::VRApplication_Background);
       m_initializedOpenVr = error == vr::VRInitError_None;
 
       if (error != vr::VRInitError_None) {
