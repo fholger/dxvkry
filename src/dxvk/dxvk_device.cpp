@@ -82,7 +82,7 @@ namespace dxvk {
 
         // Disable lifetime tracking for drivers that do not have any
         // significant issues with 32-bit address space to begin with
-        if (m_adapter->matchesDriver(VK_DRIVER_ID_MESA_RADV_KHR, 0, 0))
+        if (m_adapter->matchesDriver(VK_DRIVER_ID_MESA_RADV_KHR))
           return false;
 
         return true;
@@ -167,7 +167,7 @@ namespace dxvk {
   Rc<DxvkBufferView> DxvkDevice::createBufferView(
     const Rc<DxvkBuffer>&           buffer,
     const DxvkBufferViewCreateInfo& createInfo) {
-    return new DxvkBufferView(m_vkd, buffer, createInfo);
+    return new DxvkBufferView(this, buffer, createInfo);
   }
   
   
@@ -252,12 +252,16 @@ namespace dxvk {
 
 
   void DxvkDevice::presentImage(
-    const Rc<vk::Presenter>&        presenter,
+    const Rc<Presenter>&            presenter,
+          VkPresentModeKHR          presentMode,
+          uint64_t                  frameId,
           DxvkSubmitStatus*         status) {
     status->result = VK_NOT_READY;
 
-    DxvkPresentInfo presentInfo;
+    DxvkPresentInfo presentInfo = { };
     presentInfo.presenter = presenter;
+    presentInfo.presentMode = presentMode;
+    presentInfo.frameId = frameId;
     m_submissionQueue.present(presentInfo, status);
     
     std::lock_guard<sync::Spinlock> statLock(m_statLock);
@@ -308,22 +312,25 @@ namespace dxvk {
   
   
   void DxvkDevice::waitForIdle() {
-    this->lockSubmission();
+    m_submissionQueue.waitForIdle();
+    m_submissionQueue.lockDeviceQueue();
+
     if (m_vkd->vkDeviceWaitIdle(m_vkd->device()) != VK_SUCCESS)
       Logger::err("DxvkDevice: waitForIdle: Operation failed");
-    this->unlockSubmission();
+
+    m_submissionQueue.unlockDeviceQueue();
   }
   
   
   DxvkDevicePerfHints DxvkDevice::getPerfHints() {
     DxvkDevicePerfHints hints;
     hints.preferFbDepthStencilCopy = m_features.extShaderStencilExport
-      && (m_adapter->matchesDriver(VK_DRIVER_ID_MESA_RADV_KHR, 0, 0)
-       || m_adapter->matchesDriver(VK_DRIVER_ID_AMD_OPEN_SOURCE_KHR, 0, 0)
-       || m_adapter->matchesDriver(VK_DRIVER_ID_AMD_PROPRIETARY_KHR, 0, 0));
+      && (m_adapter->matchesDriver(VK_DRIVER_ID_MESA_RADV_KHR)
+       || m_adapter->matchesDriver(VK_DRIVER_ID_AMD_OPEN_SOURCE_KHR)
+       || m_adapter->matchesDriver(VK_DRIVER_ID_AMD_PROPRIETARY_KHR));
     hints.preferFbResolve = m_features.amdShaderFragmentMask
-      && (m_adapter->matchesDriver(VK_DRIVER_ID_AMD_OPEN_SOURCE_KHR, 0, 0)
-       || m_adapter->matchesDriver(VK_DRIVER_ID_AMD_PROPRIETARY_KHR, 0, 0));
+      && (m_adapter->matchesDriver(VK_DRIVER_ID_AMD_OPEN_SOURCE_KHR)
+       || m_adapter->matchesDriver(VK_DRIVER_ID_AMD_PROPRIETARY_KHR));
     return hints;
   }
 

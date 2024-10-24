@@ -52,6 +52,9 @@ namespace dxvk {
     
     /// Size of the buffer region to include in the view
     VkDeviceSize rangeLength;
+
+    /// Buffer view usage flags
+    VkBufferUsageFlags usage;
   };
 
 
@@ -80,6 +83,12 @@ namespace dxvk {
   struct DxvkBufferHandle {
     VkBuffer      buffer = VK_NULL_HANDLE;
     DxvkMemory    memory;
+
+    VkDeviceSize getBaseOffset() const {
+      return buffer == memory.buffer()
+        ? memory.offset()
+        : 0u;
+    }
   };
   
 
@@ -219,16 +228,6 @@ namespace dxvk {
     }
 
     /**
-     * \brief Retrieves dynamic offset
-     * 
-     * \param [in] offset Offset into the buffer
-     * \returns Offset for dynamic descriptors
-     */
-    VkDeviceSize getDynamicOffset(VkDeviceSize offset) const {
-      return m_physSlice.offset + offset;
-    }
-    
-    /**
      * \brief Replaces backing resource
      * 
      * Replaces the underlying buffer and implicitly marks
@@ -356,9 +355,9 @@ namespace dxvk {
     void pushSlice(const DxvkBufferHandle& handle, uint32_t index) {
       DxvkBufferSliceHandle slice;
       slice.handle = handle.buffer;
+      slice.offset = handle.getBaseOffset() + m_physSliceStride * index;
       slice.length = m_physSliceLength;
-      slice.offset = m_physSliceStride * index;
-      slice.mapPtr = handle.memory.mapPtr(slice.offset);
+      slice.mapPtr = handle.memory.mapPtr(m_physSliceStride * index);
       m_freeSlices.push_back(slice);
     }
 
@@ -367,6 +366,8 @@ namespace dxvk {
             bool                  clear) const;
 
     DxvkBufferHandle createSparseBuffer() const;
+
+    VkBuffer createBuffer(const VkBufferCreateInfo& info) const;
 
     VkDeviceSize computeSliceAlignment(
             DxvkDevice*           device) const;
@@ -494,16 +495,6 @@ namespace dxvk {
     DxvkDescriptorInfo getDescriptor() const {
       return m_buffer->getDescriptor(m_offset, m_length);
     }
-
-    /**
-     * \brief Retrieves dynamic offset
-     * 
-     * Used for descriptor set binding.
-     * \returns Buffer slice offset
-     */
-    VkDeviceSize getDynamicOffset() const {
-      return m_buffer->getDynamicOffset(m_offset);
-    }
     
     /**
      * \brief Pointer to mapped memory region
@@ -589,7 +580,7 @@ namespace dxvk {
   public:
     
     DxvkBufferView(
-      const Rc<vk::DeviceFn>&         vkd,
+            DxvkDevice*               device,
       const Rc<DxvkBuffer>&           buffer,
       const DxvkBufferViewCreateInfo& info);
     
@@ -688,6 +679,7 @@ namespace dxvk {
     Rc<vk::DeviceFn>          m_vkd;
     DxvkBufferViewCreateInfo  m_info;
     Rc<DxvkBuffer>            m_buffer;
+    VkBufferUsageFlags        m_usage;
 
     DxvkBufferSliceHandle     m_bufferSlice;
     VkBufferView              m_bufferView;

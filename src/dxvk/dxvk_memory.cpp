@@ -12,6 +12,7 @@ namespace dxvk {
           DxvkMemoryAllocator*  alloc,
           DxvkMemoryChunk*      chunk,
           DxvkMemoryType*       type,
+          VkBuffer              buffer,
           VkDeviceMemory        memory,
           VkDeviceSize          offset,
           VkDeviceSize          length,
@@ -19,6 +20,7 @@ namespace dxvk {
   : m_alloc   (alloc),
     m_chunk   (chunk),
     m_type    (type),
+    m_buffer  (buffer),
     m_memory  (memory),
     m_offset  (offset),
     m_length  (length),
@@ -29,6 +31,7 @@ namespace dxvk {
   : m_alloc   (std::exchange(other.m_alloc,  nullptr)),
     m_chunk   (std::exchange(other.m_chunk,  nullptr)),
     m_type    (std::exchange(other.m_type,   nullptr)),
+    m_buffer  (std::exchange(other.m_buffer, VkBuffer(VK_NULL_HANDLE))),
     m_memory  (std::exchange(other.m_memory, VkDeviceMemory(VK_NULL_HANDLE))),
     m_offset  (std::exchange(other.m_offset, 0)),
     m_length  (std::exchange(other.m_length, 0)),
@@ -40,6 +43,7 @@ namespace dxvk {
     m_alloc   = std::exchange(other.m_alloc,  nullptr);
     m_chunk   = std::exchange(other.m_chunk,  nullptr);
     m_type    = std::exchange(other.m_type,   nullptr);
+    m_buffer  = std::exchange(other.m_buffer, VkBuffer(VK_NULL_HANDLE));
     m_memory  = std::exchange(other.m_memory, VkDeviceMemory(VK_NULL_HANDLE));
     m_offset  = std::exchange(other.m_offset, 0);
     m_length  = std::exchange(other.m_length, 0);
@@ -126,7 +130,7 @@ namespace dxvk {
     
     // Create the memory object with the aligned slice
     return DxvkMemory(m_alloc, this, m_type,
-      m_memory.memHandle, allocStart, allocEnd - allocStart,
+      m_memory.buffer, m_memory.memHandle, allocStart, allocEnd - allocStart,
       reinterpret_cast<char*>(m_memory.memPointer) + allocStart);
   }
   
@@ -183,12 +187,10 @@ namespace dxvk {
 
   DxvkMemoryAllocator::DxvkMemoryAllocator(DxvkDevice* device)
   : m_device          (device),
-    m_memProps        (device->adapter()->memoryProperties()),
-    m_maxChunkSize    (determineMaxChunkSize(device)) {
+    m_memProps        (device->adapter()->memoryProperties()) {
     for (uint32_t i = 0; i < m_memProps.memoryHeapCount; i++) {
       m_memHeaps[i].properties = m_memProps.memoryHeaps[i];
       m_memHeaps[i].stats      = DxvkMemoryStats { 0, 0 };
-      m_memHeaps[i].budget     = 0;
     }
     
     for (uint32_t i = 0; i < m_memProps.memoryTypeCount; i++) {
@@ -196,10 +198,14 @@ namespace dxvk {
       m_memTypes[i].heapId     = m_memProps.memoryTypes[i].heapIndex;
       m_memTypes[i].memType    = m_memProps.memoryTypes[i];
       m_memTypes[i].memTypeId  = i;
+      m_memTypes[i].chunkSize  = MinChunkSize;
+      m_memTypes[i].bufferUsage = 0;
     }
 
     if (device->features().core.features.sparseBinding)
       m_sparseMemoryTypes = determineSparseMemoryTypes(device);
+
+    determineBufferUsageFlagsPerMemoryType();
   }
   
   
@@ -314,7 +320,10 @@ namespace dxvk {
           VkDeviceSize                      align,
     const DxvkMemoryProperties&             info,
           DxvkMemoryFlags                   hints) {
-    VkDeviceSize chunkSize = pickChunkSize(type->memTypeId, hints);
+    constexpr VkDeviceSize DedicatedAllocationThreshold = 3;
+
+    VkDeviceSize chunkSize = pickChunkSize(type->memTypeId,
+      DedicatedAllocationThreshold * size, hints);
 
     DxvkMemory memory;
 
@@ -324,7 +333,7 @@ namespace dxvk {
 
     // Prefer a dedicated allocation for very large resources in order to
     // reduce fragmentation if a large number of those resources are in use
-    bool wantsDedicatedAllocation = 3 * size >= chunkSize;
+    bool wantsDedicatedAllocation = DedicatedAllocationThreshold * size > chunkSize;
 
     // Try to reuse existing memory as much as possible in case the heap is nearly full
     bool heapBudgedExceeded = 5 * type->heap->stats.memoryUsed + size > 4 * type->heap->properties.size;
@@ -333,12 +342,12 @@ namespace dxvk {
       // Attempt to suballocate from existing chunks first
       for (uint32_t i = 0; i < type->chunks.size() && !memory; i++)
         memory = type->chunks[i]->alloc(info.flags, size, align, hints);
-      
+
       // If no existing chunk can accomodate the allocation, and if a dedicated
       // allocation is not preferred, create a new chunk and suballocate from it
       if (!memory && !wantsDedicatedAllocation) {
         DxvkDeviceMemory devMem;
-        
+
         if (this->shouldFreeEmptyChunks(type->heap, chunkSize))
           this->freeEmptyChunks(type->heap);
 
@@ -350,6 +359,8 @@ namespace dxvk {
           memory = chunk->alloc(info.flags, size, align, hints);
 
           type->chunks.push_back(std::move(chunk));
+
+          adjustChunkSize(type->memTypeId, devMem.memSize, hints);
         }
       }
     }
@@ -362,8 +373,10 @@ namespace dxvk {
 
       DxvkDeviceMemory devMem = this->tryAllocDeviceMemory(type, size, info, hints);
 
-      if (devMem.memHandle != VK_NULL_HANDLE)
-        memory = DxvkMemory(this, nullptr, type, devMem.memHandle, 0, size, devMem.memPointer);
+      if (devMem.memHandle != VK_NULL_HANDLE) {
+        memory = DxvkMemory(this, nullptr, type,
+          devMem.buffer, devMem.memHandle, 0, size, devMem.memPointer);
+      }
     }
 
     if (memory) {
@@ -385,9 +398,6 @@ namespace dxvk {
     bool useMemoryPriority = (info.flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
                           && (m_device->features().extMemoryPriority.memoryPriority);
     
-    if (type->heap->budget && type->heap->stats.memoryAllocated + size > type->heap->budget)
-      return DxvkDeviceMemory();
-
     float priority = 0.0f;
 
     if (hints.test(DxvkMemoryFlag::GpuReadable))
@@ -395,10 +405,15 @@ namespace dxvk {
     if (hints.test(DxvkMemoryFlag::GpuWritable))
       priority = 1.0f;
 
+    bool dedicated = info.dedicated.buffer || info.dedicated.image;
+
     DxvkDeviceMemory result;
     result.memSize  = size;
     result.memFlags = info.flags;
     result.priority = priority;
+
+    VkMemoryAllocateFlagsInfo memoryFlags = { VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO };
+    memoryFlags.flags |= VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
 
     VkMemoryPriorityAllocateInfoEXT priorityInfo = { VK_STRUCTURE_TYPE_MEMORY_PRIORITY_ALLOCATE_INFO_EXT };
     priorityInfo.priority       = priority;
@@ -419,6 +434,9 @@ namespace dxvk {
     if (useMemoryPriority)
       priorityInfo.pNext = std::exchange(memoryInfo.pNext, &priorityInfo);
 
+    if (!info.dedicated.image && (type->bufferUsage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT))
+      memoryFlags.pNext = std::exchange(memoryInfo.pNext, &memoryFlags);
+
     if (vk->vkAllocateMemory(vk->device(), &memoryInfo, nullptr, &result.memHandle))
       return DxvkDeviceMemory();
     
@@ -429,6 +447,43 @@ namespace dxvk {
         Logger::err(str::format("DxvkMemoryAllocator: Mapping memory failed with ", status));
         vk->vkFreeMemory(vk->device(), result.memHandle, nullptr);
         return DxvkDeviceMemory();
+      }
+    }
+
+    if (type->bufferUsage && !dedicated) {
+      VkBuffer buffer = VK_NULL_HANDLE;
+
+      VkBufferCreateInfo bufferInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+      bufferInfo.size = result.memSize;
+      bufferInfo.usage = type->bufferUsage;
+      bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+      VkResult status = vk->vkCreateBuffer(vk->device(), &bufferInfo, nullptr, &buffer);
+
+      if (status == VK_SUCCESS) {
+        VkBufferMemoryRequirementsInfo2 memInfo = { VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2 };
+        memInfo.buffer = buffer;
+
+        VkMemoryRequirements2 requirements = { VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2 };
+        vk->vkGetBufferMemoryRequirements2(vk->device(), &memInfo, &requirements);
+
+        if ((requirements.memoryRequirements.size == size)
+         && (requirements.memoryRequirements.memoryTypeBits & (1u << type->memTypeId))) {
+          status = vk->vkBindBufferMemory(vk->device(), buffer, result.memHandle, 0);
+
+          if (status == VK_SUCCESS)
+            result.buffer = buffer;
+        }
+
+        if (!result.buffer)
+          vk->vkDestroyBuffer(vk->device(), buffer, nullptr);
+      }
+
+      if (!result.buffer) {
+        Logger::warn(str::format("Failed to create global buffer:",
+          "\n  size:  ", std::dec, size,
+          "\n  usage: ", std::hex, type->bufferUsage,
+          "\n  type:  ", std::dec, type->memTypeId));
       }
     }
 
@@ -451,6 +506,7 @@ namespace dxvk {
         memory.m_length);
     } else {
       DxvkDeviceMemory devMem;
+      devMem.buffer     = memory.m_buffer;
       devMem.memHandle  = memory.m_memory;
       devMem.memPointer = nullptr;
       devMem.memSize    = memory.m_length;
@@ -486,6 +542,7 @@ namespace dxvk {
           DxvkMemoryType*       type,
           DxvkDeviceMemory      memory) {
     auto vk = m_device->vkd();
+    vk->vkDestroyBuffer(vk->device(), memory.buffer, nullptr);
     vk->vkFreeMemory(vk->device(), memory.memHandle, nullptr);
 
     type->heap->stats.memoryAllocated -= memory.memSize;
@@ -493,12 +550,14 @@ namespace dxvk {
   }
 
 
-  VkDeviceSize DxvkMemoryAllocator::pickChunkSize(uint32_t memTypeId, DxvkMemoryFlags hints) const {
+  VkDeviceSize DxvkMemoryAllocator::pickChunkSize(uint32_t memTypeId, VkDeviceSize requiredSize, DxvkMemoryFlags hints) const {
     VkMemoryType type = m_memProps.memoryTypes[memTypeId];
     VkMemoryHeap heap = m_memProps.memoryHeaps[type.heapIndex];
 
-    // Default to a chunk size of 256 MiB
-    VkDeviceSize chunkSize = m_maxChunkSize;
+    VkDeviceSize chunkSize = m_memTypes[memTypeId].chunkSize;
+
+    while (chunkSize < requiredSize && chunkSize < MaxChunkSize)
+      chunkSize <<= 1u;
 
     if (hints.test(DxvkMemoryFlag::Small))
       chunkSize = std::min<VkDeviceSize>(chunkSize, 16 << 20);
@@ -517,11 +576,29 @@ namespace dxvk {
   }
 
 
+  void DxvkMemoryAllocator::adjustChunkSize(
+          uint32_t              memTypeId,
+          VkDeviceSize          allocatedSize,
+          DxvkMemoryFlags       hints) {
+    VkDeviceSize chunkSize = m_memTypes[memTypeId].chunkSize;
+
+    // Don't bump chunk size if we reached the maximum or if
+    // we already were unable to allocate a full chunk.
+    if (chunkSize <= allocatedSize && chunkSize <= m_memTypes[memTypeId].heap->stats.memoryAllocated)
+      m_memTypes[memTypeId].chunkSize = pickChunkSize(memTypeId, chunkSize * 2, DxvkMemoryFlags());
+  }
+
+
   bool DxvkMemoryAllocator::shouldFreeChunk(
     const DxvkMemoryType*       type,
     const Rc<DxvkMemoryChunk>&  chunk) const {
     // Under memory pressure, we should start freeing everything.
     if (this->shouldFreeEmptyChunks(type->heap, 0))
+      return true;
+
+    // Free chunks that are below the current chunk size since it probably
+    // not going to be able to serve enough allocations to be useful.
+    if (chunk->size() < type->chunkSize)
       return true;
 
     // Only keep a small number of chunks of each type around to save memory.
@@ -547,11 +624,7 @@ namespace dxvk {
   bool DxvkMemoryAllocator::shouldFreeEmptyChunks(
     const DxvkMemoryHeap*       heap,
           VkDeviceSize          allocationSize) const {
-    VkDeviceSize budget = heap->budget;
-
-    if (!budget)
-      budget = (heap->properties.size * 4) / 5;
-
+    VkDeviceSize budget = (heap->properties.size * 4) / 5;
     return heap->stats.memoryAllocated + allocationSize > budget;
   }
 
@@ -576,7 +649,7 @@ namespace dxvk {
           DxvkDevice*           device) const {
     auto vk = device->vkd();
 
-    VkMemoryRequirements requirements = { };
+    VkMemoryRequirements2 requirements = { VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2 };
     uint32_t typeMask = ~0u;
 
     // Create sparse dummy buffer to find available memory types
@@ -596,16 +669,8 @@ namespace dxvk {
                             | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
     bufferInfo.sharingMode  = VK_SHARING_MODE_EXCLUSIVE;
 
-    VkBuffer buffer = VK_NULL_HANDLE;
-
-    if (vk->vkCreateBuffer(vk->device(), &bufferInfo, nullptr, &buffer)) {
-      Logger::err("Failed to create dummy buffer to query sparse memory types");
-      return 0;
-    }
-
-    vk->vkGetBufferMemoryRequirements(vk->device(), buffer, &requirements);
-    vk->vkDestroyBuffer(vk->device(), buffer, nullptr);
-    typeMask &= requirements.memoryTypeBits;
+    if (getBufferMemoryRequirements(bufferInfo, requirements))
+      typeMask &= requirements.memoryRequirements.memoryTypeBits;
 
     // Create sparse dummy image to find available memory types
     VkImageCreateInfo imageInfo = { VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO };
@@ -626,16 +691,8 @@ namespace dxvk {
                             | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     imageInfo.sharingMode   = VK_SHARING_MODE_EXCLUSIVE;
 
-    VkImage image = VK_NULL_HANDLE;
-
-    if (vk->vkCreateImage(vk->device(), &imageInfo, nullptr, &image)) {
-      Logger::err("Failed to create dummy image to query sparse memory types");
-      return 0;
-    }
-
-    vk->vkGetImageMemoryRequirements(vk->device(), image, &requirements);
-    vk->vkDestroyImage(vk->device(), image, nullptr);
-    typeMask &= requirements.memoryTypeBits;
+    if (getImageMemoryRequirements(imageInfo, requirements))
+      typeMask &= requirements.memoryRequirements.memoryTypeBits;
 
     Logger::log(typeMask ? LogLevel::Info : LogLevel::Error,
       str::format("Memory type mask for sparse resources: 0x", std::hex, typeMask));
@@ -643,14 +700,124 @@ namespace dxvk {
   }
 
 
-  VkDeviceSize DxvkMemoryAllocator::determineMaxChunkSize(
-          DxvkDevice*           device) const {
-    int32_t option = device->config().maxChunkSize;
+  void DxvkMemoryAllocator::determineBufferUsageFlagsPerMemoryType() {
+    VkBufferUsageFlags flags = VK_BUFFER_USAGE_INDIRECT_BUFFER_BIT
+                             | VK_BUFFER_USAGE_VERTEX_BUFFER_BIT
+                             | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT
+                             | VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT
+                             | VK_BUFFER_USAGE_UNIFORM_TEXEL_BUFFER_BIT;
 
-    if (option <= 0)
-      option = 256;
+    // Lock storage texel buffer usage to maintenance5 support since we will
+    // otherwise not be able to legally use formats that support one type of
+    // texel buffer but not the other. Also lock index buffer usage since we
+    // cannot explicitly specify a buffer range otherwise.
+    if (m_device->features().khrMaintenance5.maintenance5) {
+      flags |= VK_BUFFER_USAGE_INDEX_BUFFER_BIT
+            |  VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT;
+    }
 
-    return VkDeviceSize(option) << 20;
+    if (m_device->features().extTransformFeedback.transformFeedback) {
+      flags |= VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_BUFFER_BIT_EXT
+            |  VK_BUFFER_USAGE_TRANSFORM_FEEDBACK_COUNTER_BUFFER_BIT_EXT;
+    }
+
+    if (m_device->features().vk12.bufferDeviceAddress)
+      flags |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
+
+    // Check which individual flags are supported on each memory type. This is a
+    // bit dodgy since the spec technically does not require a combination of flags
+    // to be supported, but we need to be robust around buffer creation anyway.
+    VkBufferCreateInfo bufferInfo = { VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO };
+    bufferInfo.size = 65536;
+    bufferInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+
+    VkMemoryRequirements2 requirements = { VK_STRUCTURE_TYPE_MEMORY_REQUIREMENTS_2 };
+
+    while (flags) {
+      VkBufferCreateFlags flag = flags & -flags;
+
+      bufferInfo.usage = flag
+        | VK_BUFFER_USAGE_TRANSFER_DST_BIT
+        | VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+
+      if (getBufferMemoryRequirements(bufferInfo, requirements)) {
+        uint32_t typeMask = requirements.memoryRequirements.memoryTypeBits;
+
+        while (typeMask) {
+          uint32_t type = bit::tzcnt(typeMask);
+
+          if (type < m_memProps.memoryTypeCount)
+            m_memTypes.at(type).bufferUsage |= bufferInfo.usage;
+
+          typeMask &= typeMask - 1;
+        }
+      }
+
+      flags &= ~flag;
+    }
+
+    // Only use a minimal set of usage flags for the global buffer if the
+    // full combination of flags is not supported for whatever reason.
+    for (uint32_t i = 0; i < m_memProps.memoryTypeCount; i++) {
+      bufferInfo.usage = m_memTypes[i].bufferUsage;
+
+      if (!getBufferMemoryRequirements(bufferInfo, requirements)
+       || !(requirements.memoryRequirements.memoryTypeBits & (1u << i))) {
+        m_memTypes[i].bufferUsage &= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT
+                                  |  VK_BUFFER_USAGE_TRANSFER_DST_BIT
+                                  |  VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+      }
+    }
+  }
+
+
+  bool DxvkMemoryAllocator::getBufferMemoryRequirements(
+    const VkBufferCreateInfo&     createInfo,
+          VkMemoryRequirements2&  memoryRequirements) const {
+    auto vk = m_device->vkd();
+
+    if (m_device->features().vk13.maintenance4) {
+      VkDeviceBufferMemoryRequirements info = { VK_STRUCTURE_TYPE_DEVICE_BUFFER_MEMORY_REQUIREMENTS };
+      info.pCreateInfo = &createInfo;
+
+      vk->vkGetDeviceBufferMemoryRequirements(vk->device(), &info, &memoryRequirements);
+      return true;
+    } else {
+      VkBufferMemoryRequirementsInfo2 info = { VK_STRUCTURE_TYPE_BUFFER_MEMORY_REQUIREMENTS_INFO_2 };
+      VkResult vr = vk->vkCreateBuffer(vk->device(), &createInfo, nullptr, &info.buffer);
+
+      if (vr != VK_SUCCESS)
+        return false;
+
+      vk->vkGetBufferMemoryRequirements2(vk->device(), &info, &memoryRequirements);
+      vk->vkDestroyBuffer(vk->device(), info.buffer, nullptr);
+      return true;
+    }
+  }
+
+
+  bool DxvkMemoryAllocator::getImageMemoryRequirements(
+    const VkImageCreateInfo&      createInfo,
+          VkMemoryRequirements2&  memoryRequirements) const {
+    auto vk = m_device->vkd();
+
+    if (m_device->features().vk13.maintenance4) {
+      VkDeviceImageMemoryRequirements info = { VK_STRUCTURE_TYPE_DEVICE_IMAGE_MEMORY_REQUIREMENTS };
+      info.pCreateInfo = &createInfo;
+
+      vk->vkGetDeviceImageMemoryRequirements(vk->device(), &info, &memoryRequirements);
+      return true;
+    } else {
+      VkImageMemoryRequirementsInfo2 info = { VK_STRUCTURE_TYPE_IMAGE_MEMORY_REQUIREMENTS_INFO_2 };
+      VkResult vr = vk->vkCreateImage(vk->device(), &createInfo, nullptr, &info.image);
+
+      if (vr != VK_SUCCESS)
+        return false;
+
+      vk->vkGetImageMemoryRequirements2(vk->device(), &info, &memoryRequirements);
+      vk->vkDestroyImage(vk->device(), info.image, nullptr);
+      return true;
+    }
   }
 
 

@@ -3,6 +3,7 @@
 #include "d3d9_monitor.h"
 #include "d3d9_caps.h"
 #include "d3d9_device.h"
+#include "d3d9_bridge.h"
 
 #include "../util/util_singleton.h"
 
@@ -13,7 +14,8 @@ namespace dxvk {
   Singleton<DxvkInstance> g_dxvkInstance;
 
   D3D9InterfaceEx::D3D9InterfaceEx(bool bExtended)
-    : m_instance    ( g_dxvkInstance.acquire() )
+    : m_instance    ( g_dxvkInstance.acquire(DxvkInstanceFlag::ClientApiIsD3D9) )
+    , m_d3d8Bridge  ( this )
     , m_extended    ( bExtended ) 
     , m_d3d9Options ( nullptr, m_instance->config() )
     , m_d3d9Interop ( this ) {
@@ -83,6 +85,11 @@ namespace dxvk {
      || riid == __uuidof(IDirect3D9)
      || (m_extended && riid == __uuidof(IDirect3D9Ex))) {
       *ppvObject = ref(this);
+      return S_OK;
+    }
+
+    if (riid == __uuidof(IDxvkD3D8InterfaceBridge)) {
+      *ppvObject = ref(&m_d3d8Bridge);
       return S_OK;
     }
 
@@ -345,6 +352,12 @@ namespace dxvk {
 
     if (ppReturnedDeviceInterface == nullptr
     || pPresentationParameters    == nullptr)
+      return D3DERR_INVALIDCALL;
+
+    // creating a device with D3DCREATE_PUREDEVICE only works in conjunction
+    // with D3DCREATE_HARDWARE_VERTEXPROCESSING on native drivers
+    if (BehaviorFlags & D3DCREATE_PUREDEVICE &&
+    !(BehaviorFlags & D3DCREATE_HARDWARE_VERTEXPROCESSING))
       return D3DERR_INVALIDCALL;
 
     auto* adapter = GetAdapter(Adapter);

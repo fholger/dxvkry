@@ -71,6 +71,9 @@ namespace dxvk {
     void FlushImplicit();
     void FlushInternal();
 
+    void SyncSharedTexture(
+            D3D11CommonTexture*         pResource);
+
   };
 
 }

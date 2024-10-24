@@ -27,11 +27,20 @@ namespace dxvk {
     /// Shader-related options
     Tristate useRawSsbo;
 
-    /// Maximum memory chunk size in MiB
-    int32_t maxChunkSize;
-
     /// HUD elements
     std::string hud;
+
+    /// Forces swap chain into MAILBOX (if true)
+    /// or FIFO_RELAXED (if false) present mode
+    Tristate tearFree;
+
+    // Hides integrated GPUs if dedicated GPUs are
+    // present. May be necessary for some games that
+    // incorrectly assume monitor layouts.
+    bool hideIntegratedGraphics;
+
+    // Device name
+    std::string deviceFilter;
   };
 
 }

@@ -42,13 +42,14 @@ namespace dxvk {
     /// Should the SWVP float constant buffer be a SSBO (because of the size on NV)
     bool vertexFloatConstantBufferAsSSBO;
 
-    /// Should we make our Mads a FFma or do it the long way with an FMul and an FAdd?
-    /// This solves some rendering bugs in games that have z-pass shaders which
-    /// don't match entirely to the regular vertex shader in this way.
-    bool longMad;
-
     /// Whether or not we can rely on robustness2 to handle oob constant access
     bool robustness2Supported;
+
+    /// Whether runtime to apply Dref scaling for depth textures of specified bit depth
+    /// (24: D24S8, 16: D16, 0: Disabled). This allows compatability with games
+    /// that expect a different depth test range, which was typically a D3D8 quirk on
+    /// early NVIDIA hardware.
+    int32_t drefScaling = 0;
   };
 
 }

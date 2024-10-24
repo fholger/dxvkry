@@ -1,4 +1,6 @@
-#include "../wsi_monitor.h"
+#if defined(DXVK_WSI_WIN32)
+
+#include "wsi_platform_win32.h"
 
 #include "../../util/util_string.h"
 #include "../../util/log/log.h"
@@ -13,12 +15,12 @@
 
 namespace dxvk::wsi {
 
-  HMONITOR getDefaultMonitor() {
+  HMONITOR Win32WsiDriver::getDefaultMonitor() {
     return ::MonitorFromPoint({ 0, 0 }, MONITOR_DEFAULTTOPRIMARY);
   }
 
   struct MonitorEnumInfo {
-    const WCHAR *gdiDeviceName;
+    std::set<std::wstring> *gdiDeviceNames;
     UINT      iMonitorId;
     HMONITOR  oMonitor;
   };
@@ -30,13 +32,13 @@ namespace dxvk::wsi {
           LPARAM                    lp) {
     auto data = reinterpret_cast<MonitorEnumInfo*>(lp);
 
-    if (data->gdiDeviceName)
+    if (data->gdiDeviceNames)
     {
       MONITORINFOEXW monitorInfo;
 
       monitorInfo.cbSize = sizeof(monitorInfo);
       GetMonitorInfoW(hmon, (MONITORINFO *)&monitorInfo);
-      if (wcscmp(data->gdiDeviceName, monitorInfo.szDevice))
+      if (data->gdiDeviceNames->find(monitorInfo.szDevice) == data->gdiDeviceNames->end())
         return TRUE;
     }
     if (data->iMonitorId--)
@@ -45,11 +47,11 @@ namespace dxvk::wsi {
     return FALSE;
   }
 
-  HMONITOR enumMonitors(uint32_t index) {
+  HMONITOR Win32WsiDriver::enumMonitors(uint32_t index) {
     MonitorEnumInfo info;
     info.iMonitorId = index;
     info.oMonitor   = nullptr;
-    info.gdiDeviceName = nullptr;
+    info.gdiDeviceNames = nullptr;
 
     ::EnumDisplayMonitors(
       nullptr, nullptr, &MonitorEnumProc,
@@ -58,13 +60,14 @@ namespace dxvk::wsi {
     return info.oMonitor;
   }
 
-  HMONITOR enumMonitors(const LUID *adapterLUID[], uint32_t numLUIDs, uint32_t index) {
+  HMONITOR Win32WsiDriver::enumMonitors(const LUID *adapterLUID[], uint32_t numLUIDs, uint32_t index) {
     if (!numLUIDs)
       return enumMonitors(index);
 
     std::vector<DISPLAYCONFIG_PATH_INFO> paths;
     std::vector<DISPLAYCONFIG_MODE_INFO> modes;
     std::set<std::pair<uint32_t, uint32_t>> sources;
+    std::set<std::wstring> gdiDeviceNames;
     UINT32 pathCount = 0;
     UINT32 modeCount = 0;
     LONG result;
@@ -93,6 +96,7 @@ namespace dxvk::wsi {
     MonitorEnumInfo info;
     info.iMonitorId = index;
     info.oMonitor = nullptr;
+    info.gdiDeviceNames = &gdiDeviceNames;
 
     for (const auto &path : paths) {
       uint32_t i;
@@ -121,20 +125,16 @@ namespace dxvk::wsi {
         return enumMonitors(index);
       }
 
-      info.gdiDeviceName = deviceName.viewGdiDeviceName;
-
-      ::EnumDisplayMonitors(
-        nullptr, nullptr, &MonitorEnumProc,
-        reinterpret_cast<LPARAM>(&info));
-
-      if (info.oMonitor != nullptr)
-        return info.oMonitor;
+      gdiDeviceNames.insert(deviceName.viewGdiDeviceName);
     }
-    return nullptr;
+    ::EnumDisplayMonitors(
+      nullptr, nullptr, &MonitorEnumProc,
+      reinterpret_cast<LPARAM>(&info));
+    return info.oMonitor;
   }
 
 
-  bool getDisplayName(
+  bool Win32WsiDriver::getDisplayName(
           HMONITOR         hMonitor,
           WCHAR            (&Name)[32]) {
     // Query monitor info to get the device name
@@ -152,7 +152,7 @@ namespace dxvk::wsi {
   }
 
 
-  bool getDesktopCoordinates(
+  bool Win32WsiDriver::getDesktopCoordinates(
           HMONITOR         hMonitor,
           RECT*            pRect) {
     ::MONITORINFOEXW monInfo;
@@ -202,7 +202,7 @@ namespace dxvk::wsi {
   }
 
 
-  bool getDisplayMode(
+  bool Win32WsiDriver::getDisplayMode(
           HMONITOR         hMonitor,
           uint32_t         modeNumber,
           WsiMode*         pMode) {
@@ -210,14 +210,14 @@ namespace dxvk::wsi {
   }
 
 
-  bool getCurrentDisplayMode(
+  bool Win32WsiDriver::getCurrentDisplayMode(
           HMONITOR         hMonitor,
           WsiMode*         pMode) {
     return retrieveDisplayMode(hMonitor, ENUM_CURRENT_SETTINGS, pMode);
   }
 
 
-  bool getDesktopDisplayMode(
+  bool Win32WsiDriver::getDesktopDisplayMode(
           HMONITOR         hMonitor,
           WsiMode*         pMode) {
     return retrieveDisplayMode(hMonitor, ENUM_REGISTRY_SETTINGS, pMode);
@@ -310,7 +310,7 @@ namespace dxvk::wsi {
     wchar_t extraChars[MAX_DEVICE_ID_LEN];
   };
 
-  WsiEdidData getMonitorEdid(HMONITOR hMonitor) {
+  WsiEdidData Win32WsiDriver::getMonitorEdid(HMONITOR hMonitor) {
     static constexpr GUID GUID_DEVINTERFACE_MONITOR = { 0xe6f07b5f, 0xee97, 0x4a90, 0xb0, 0x76, 0x33, 0xf5, 0x7b, 0xf4, 0xea, 0xa7 };
     static auto pfnSetupDiGetClassDevsW             = reinterpret_cast<decltype(SetupDiGetClassDevsW)*>            (::GetProcAddress(::GetModuleHandleW(L"setupapi.dll"), "SetupDiGetClassDevsW"));
     static auto pfnSetupDiEnumDeviceInterfaces      = reinterpret_cast<decltype(SetupDiEnumDeviceInterfaces)*>     (::GetProcAddress(::GetModuleHandleW(L"setupapi.dll"), "SetupDiEnumDeviceInterfaces"));
@@ -372,3 +372,5 @@ namespace dxvk::wsi {
   }
 
 }
+
+#endif

@@ -26,6 +26,7 @@ namespace dxvk {
       auto buffer = static_cast<D3D11Buffer*>(pResource);
       
       DxvkBufferViewCreateInfo viewInfo;
+      viewInfo.usage = VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT;
       
       if (pDesc->Buffer.Flags & D3D11_BUFFEREX_SRV_FLAG_RAW) {
         viewInfo.format      = VK_FORMAT_R32_UINT;
@@ -129,6 +130,7 @@ namespace dxvk {
   
   D3D11UnorderedAccessView::~D3D11UnorderedAccessView() {
     ResourceReleasePrivate(m_resource);
+    m_resource = nullptr;
   }
   
   
@@ -214,7 +216,7 @@ namespace dxvk {
         D3D11_BUFFER_DESC bufferDesc;
         static_cast<D3D11Buffer*>(pResource)->GetDesc(&bufferDesc);
         
-        if (bufferDesc.MiscFlags == D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) {
+        if (bufferDesc.MiscFlags & D3D11_RESOURCE_MISC_BUFFER_STRUCTURED) {
           pDesc->Format              = DXGI_FORMAT_UNKNOWN;
           pDesc->ViewDimension       = D3D11_UAV_DIMENSION_BUFFER;
           pDesc->Buffer.FirstElement = 0;
@@ -453,6 +455,7 @@ namespace dxvk {
     viewInfo.format = VK_FORMAT_UNDEFINED;
     viewInfo.rangeOffset = 0;
     viewInfo.rangeLength = sizeof(uint32_t);
+    viewInfo.usage = VK_BUFFER_USAGE_STORAGE_TEXEL_BUFFER_BIT;
 
     return device->createBufferView(buffer, viewInfo);
   }

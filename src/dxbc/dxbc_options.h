@@ -27,9 +27,8 @@ namespace dxvk {
     /// on typed UAV loads are required
     bool supportsTypedUavLoadR32 = false;
 
-    /// Use subgroup operations to reduce the number of
-    /// atomic operations for append/consume buffers.
-    bool useSubgroupOpsForAtomicCounters = false;
+    /// Determines whether raw access chains are supported
+    bool supportsRawAccessChains = false;
 
     /// Clear thread-group shared memory to zero
     bool zeroInitWorkgroupMemory = false;
