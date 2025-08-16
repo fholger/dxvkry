@@ -30,14 +30,19 @@ namespace dxvk {
     /// Determines whether raw access chains are supported
     bool supportsRawAccessChains = false;
 
-    /// Clear thread-group shared memory to zero
-    bool zeroInitWorkgroupMemory = false;
+    /// Whether raw access require a normal access chain
+    /// for the binding to work properly
+    bool rawAccessChainBug = false;
 
     /// Declare vertex positions as invariant
     bool invariantPosition = false;
 
     /// Insert memory barriers after TGSM stoes
     bool forceVolatileTgsmAccess = false;
+
+    /// Try to detect hazards in UAV access and insert
+    /// barriers when we know control flow is uniform.
+    bool forceComputeUavBarriers = false;
 
     /// Replace ld_ms with ld
     bool disableMsaa = false;
@@ -48,6 +53,15 @@ namespace dxvk {
 
     // Enable per-sample interlock if supported
     bool enableSampleShadingInterlock = false;
+
+    /// Whether exporting point size is required
+    bool needsPointSizeExport = false;
+
+    /// Whether to enable sincos emulation
+    bool sincosEmulation = false;
+
+    /// Whether device suppors 16-bit push constants
+    bool supports16BitPushData = false;
 
     /// Float control flags
     DxbcFloatControlFlags floatControl;

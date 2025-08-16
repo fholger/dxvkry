@@ -1,5 +1,6 @@
 #pragma once
 
+#include "dxvk_format.h"
 #include "dxvk_limits.h"
 
 #include <cstring>
@@ -219,14 +220,12 @@ namespace dxvk {
 
     DxvkRsInfo(
             VkBool32              depthClipEnable,
-            VkBool32              depthBiasEnable,
             VkPolygonMode         polygonMode,
             VkSampleCountFlags    sampleCount,
             VkConservativeRasterizationModeEXT conservativeMode,
             VkBool32              flatShading,
             VkLineRasterizationModeEXT lineMode)
     : m_depthClipEnable (uint16_t(depthClipEnable)),
-      m_depthBiasEnable (uint16_t(depthBiasEnable)),
       m_polygonMode     (uint16_t(polygonMode)),
       m_sampleCount     (uint16_t(sampleCount)),
       m_conservativeMode(uint16_t(conservativeMode)),
@@ -236,10 +235,6 @@ namespace dxvk {
     
     VkBool32 depthClipEnable() const {
       return VkBool32(m_depthClipEnable);
-    }
-
-    VkBool32 depthBiasEnable() const {
-      return VkBool32(m_depthBiasEnable);
     }
 
     VkPolygonMode polygonMode() const {
@@ -269,13 +264,12 @@ namespace dxvk {
   private:
 
     uint16_t m_depthClipEnable        : 1;
-    uint16_t m_depthBiasEnable        : 1;
     uint16_t m_polygonMode            : 2;
     uint16_t m_sampleCount            : 5;
     uint16_t m_conservativeMode       : 2;
     uint16_t m_flatShading            : 1;
     uint16_t m_lineMode               : 2;
-    uint16_t m_reserved               : 2;
+    uint16_t m_reserved               : 3;
   
   };
 
@@ -323,113 +317,6 @@ namespace dxvk {
     uint16_t m_enableAlphaToCoverage  : 1;
     uint16_t m_reserved               : 10;
     uint16_t m_sampleMask;
-
-  };
-
-
-  /**
-   * \brief Packed depth-stencil metadata
-   *
-   * Stores some flags and the depth-compare op in
-   * two bytes. Stencil ops are stored separately.
-   */
-  class DxvkDsInfo {
-
-  public:
-
-    DxvkDsInfo() = default;
-
-    DxvkDsInfo(
-            VkBool32 enableDepthTest,
-            VkBool32 enableDepthWrite,
-            VkBool32 enableDepthBoundsTest,
-            VkBool32 enableStencilTest,
-            VkCompareOp depthCompareOp)
-    : m_enableDepthTest       (uint16_t(enableDepthTest)),
-      m_enableDepthWrite      (uint16_t(enableDepthWrite)),
-      m_enableDepthBoundsTest (uint16_t(enableDepthBoundsTest)),
-      m_enableStencilTest     (uint16_t(enableStencilTest)),
-      m_depthCompareOp        (uint16_t(depthCompareOp)),
-      m_reserved              (0) { }
-    
-    VkBool32 enableDepthTest() const {
-      return VkBool32(m_enableDepthTest);
-    }
-
-    VkBool32 enableDepthWrite() const {
-      return VkBool32(m_enableDepthWrite);
-    }
-
-    VkBool32 enableDepthBoundsTest() const {
-      return VkBool32(m_enableDepthBoundsTest);
-    }
-
-    VkBool32 enableStencilTest() const {
-      return VkBool32(m_enableStencilTest);
-    }
-
-    VkCompareOp depthCompareOp() const {
-      return VkCompareOp(m_depthCompareOp);
-    }
-
-    void setEnableDepthBoundsTest(VkBool32 enableDepthBoundsTest) {
-      m_enableDepthBoundsTest = VkBool32(enableDepthBoundsTest);
-    }
-
-  private:
-
-    uint16_t m_enableDepthTest        : 1;
-    uint16_t m_enableDepthWrite       : 1;
-    uint16_t m_enableDepthBoundsTest  : 1;
-    uint16_t m_enableStencilTest      : 1;
-    uint16_t m_depthCompareOp         : 3;
-    uint16_t m_reserved               : 9;
-
-  };
-
-
-  /**
-   * \brief Packed stencil op
-   *
-   * Stores various stencil op parameters
-   * for one single face in four bytes.
-   */
-  class DxvkDsStencilOp {
-
-  public:
-
-    DxvkDsStencilOp() = default;
-
-    DxvkDsStencilOp(VkStencilOpState state)
-    : m_failOp      (uint32_t(state.failOp)),
-      m_passOp      (uint32_t(state.passOp)),
-      m_depthFailOp (uint32_t(state.depthFailOp)),
-      m_compareOp   (uint32_t(state.compareOp)),
-      m_reserved    (0),
-      m_compareMask (uint32_t(state.compareMask)),
-      m_writeMask   (uint32_t(state.writeMask)) { }
-    
-    VkStencilOpState state(bool write) const {
-      VkStencilOpState result;
-      result.failOp      = VkStencilOp(m_failOp);
-      result.passOp      = VkStencilOp(m_passOp);
-      result.depthFailOp = VkStencilOp(m_depthFailOp);
-      result.compareOp   = VkCompareOp(m_compareOp);
-      result.compareMask = m_compareMask;
-      result.writeMask   = write ? m_writeMask : 0;
-      result.reference   = 0;
-      return result;
-    }
-
-  private:
-
-    uint32_t m_failOp                 : 3;
-    uint32_t m_passOp                 : 3;
-    uint32_t m_depthFailOp            : 3;
-    uint32_t m_compareOp              : 3;
-    uint32_t m_reserved               : 4;
-    uint32_t m_compareMask            : 8;
-    uint32_t m_writeMask              : 8;
 
   };
 
@@ -534,13 +421,15 @@ namespace dxvk {
     }
 
     static uint64_t encodeColorFormat(VkFormat format, uint32_t index) {
-      uint64_t value = uint64_t(format);
+      uint64_t value = 0u;
 
-      if (value >= uint64_t(VK_FORMAT_A4R4G4B4_UNORM_PACK16)) {
-        value -= uint64_t(VK_FORMAT_A4R4G4B4_UNORM_PACK16);
-        value += uint64_t(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32) + 1;
-      } else if (value > uint64_t(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32)) {
-        value = 0;
+      for (const auto& p : s_colorFormatRanges) {
+        if (format >= p.first && format <= p.second) {
+          value += uint32_t(format) - uint32_t(p.first);
+          break;
+        }
+
+        value += uint32_t(p.second) - uint32_t(p.first) + 1u;
       }
 
       return value << (7 * index);
@@ -561,13 +450,23 @@ namespace dxvk {
     static VkFormat decodeColorFormat(uint64_t value, uint32_t index) {
       value = (value >> (7 * index)) & 0x7F;
 
-      if (value > uint64_t(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32)) {
-        value -= uint64_t(VK_FORMAT_E5B9G9R9_UFLOAT_PACK32) + 1ull;
-        value += uint64_t(VK_FORMAT_A4R4G4B4_UNORM_PACK16);
+      for (const auto& p : s_colorFormatRanges) {
+        uint32_t rangeSize = uint32_t(p.second) - uint32_t(p.first) + 1u;
+
+        if (value < rangeSize)
+          return VkFormat(uint32_t(p.first) + uint32_t(value));
+
+        value -= rangeSize;
       }
 
-      return VkFormat(value);
+      return VK_FORMAT_UNDEFINED;
     }
+
+    static constexpr std::array<std::pair<VkFormat, VkFormat>, 3> s_colorFormatRanges = {{
+      { VK_FORMAT_UNDEFINED,                  VK_FORMAT_E5B9G9R9_UFLOAT_PACK32  },  /*   0 - 123 */
+      { VK_FORMAT_A4R4G4B4_UNORM_PACK16,      VK_FORMAT_A4B4G4R4_UNORM_PACK16   },  /* 124 - 125 */
+      { VK_FORMAT_A1B5G5R5_UNORM_PACK16_KHR,  VK_FORMAT_A8_UNORM_KHR            },  /* 126 - 127 */
+    }};
 
   };
 
@@ -748,16 +647,17 @@ namespace dxvk {
       return !bit::bcmpeq(this, &other);
     }
 
-    bool useDynamicStencilRef() const {
-      return ds.enableStencilTest();
-    }
-
-    bool useDynamicDepthBias() const {
-      return rs.depthBiasEnable();
+    bool useDynamicDepthTest() const {
+      return rt.getDepthStencilFormat();
     }
 
     bool useDynamicDepthBounds() const {
-      return ds.enableDepthBoundsTest();
+      return rt.getDepthStencilFormat();
+    }
+
+    bool useDynamicStencilTest() const {
+      auto format = rt.getDepthStencilFormat();
+      return format && (lookupFormatInfo(format)->aspectMask & VK_IMAGE_ASPECT_STENCIL_BIT);
     }
 
     bool useDynamicVertexStrides() const {
@@ -808,12 +708,9 @@ namespace dxvk {
     DxvkIlInfo              il;
     DxvkRsInfo              rs;
     DxvkMsInfo              ms;
-    DxvkDsInfo              ds;
     DxvkOmInfo              om;
     DxvkRtInfo              rt;
     DxvkScInfo              sc;
-    DxvkDsStencilOp         dsFront;
-    DxvkDsStencilOp         dsBack;
     DxvkOmAttachmentSwizzle omSwizzle         [DxvkLimits::MaxNumRenderTargets];
     DxvkOmAttachmentBlend   omBlend           [DxvkLimits::MaxNumRenderTargets];
     DxvkIlAttribute         ilAttributes      [DxvkLimits::MaxNumVertexAttributes];

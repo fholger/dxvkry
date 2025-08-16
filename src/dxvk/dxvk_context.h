@@ -4,29 +4,33 @@
 #include "dxvk_bind_mask.h"
 #include "dxvk_cmdlist.h"
 #include "dxvk_context_state.h"
-#include "dxvk_data.h"
+#include "dxvk_descriptor_heap.h"
+#include "dxvk_descriptor_worker.h"
+#include "dxvk_implicit_resolve.h"
+#include "dxvk_latency.h"
 #include "dxvk_objects.h"
 #include "dxvk_queue.h"
-#include "dxvk_resource.h"
 #include "dxvk_util.h"
-#include "dxvk_marker.h"
 
 namespace dxvk {
-  
+
   /**
-   * \brief DXVk context
+   * \brief DXVK context
    * 
    * Tracks pipeline state and records command lists.
    * This is where the actual rendering commands are
    * recorded.
    */
   class DxvkContext : public RcObject {
-    constexpr static VkDeviceSize StagingBufferSize = 4ull << 20;
+    constexpr static VkDeviceSize MaxDiscardSizeInRp = 256u << 10u;
+    constexpr static VkDeviceSize MaxDiscardSize     =  16u << 10u;
+
+    constexpr static uint32_t DirectMultiDrawBatchSize = 256u;
   public:
     
-    DxvkContext(const Rc<DxvkDevice>& device, DxvkContextType type);
+    DxvkContext(const Rc<DxvkDevice>& device);
     ~DxvkContext();
-    
+
     /**
      * \brief Begins command buffer recording
      * 
@@ -47,9 +51,11 @@ namespace dxvk {
      * 
      * This will not change any context state
      * other than the active command list.
+     * \param [in] reason Optional debug label describing the reason
      * \returns Active command list
      */
-    Rc<DxvkCommandList> endRecording();
+    Rc<DxvkCommandList> endRecording(
+      const VkDebugUtilsLabelEXT*       reason);
 
     /**
      * \brief Ends frame
@@ -60,27 +66,73 @@ namespace dxvk {
     void endFrame();
 
     /**
+     * \brief Begins latency tracking
+     *
+     * Notifies the beginning of a frame on the CS timeline
+     * an ensures that subsequent submissions are associated
+     * with the correct frame ID. Only one tracker can be
+     * active at any given time.
+     * \param [in] tracker Latency tracker object
+     * \param [in] frameId Current frame ID
+     */
+    void beginLatencyTracking(
+      const Rc<DxvkLatencyTracker>&     tracker,
+            uint64_t                    frameId);
+
+    /**
+     * \brief Ends latency tracking
+     *
+     * Notifies the end of the frame. Ignored if the
+     * tracker is not currently active.
+     * \param [in] tracker Latency tracker object
+     */
+    void endLatencyTracking(
+      const Rc<DxvkLatencyTracker>&     tracker);
+
+    /**
      * \brief Flushes command buffer
      * 
      * Transparently submits the current command
      * buffer and allocates a new one.
+     * \param [in] reason Optional debug label describing the reason
      * \param [out] status Submission feedback
      */
-    void flushCommandList(DxvkSubmitStatus* status);
-    
+    void flushCommandList(
+      const VkDebugUtilsLabelEXT*       reason,
+            DxvkSubmitStatus*           status);
+
+    /**
+     * \brief Synchronizes command list with WSI
+     *
+     * The next submission can be used to render
+     * to the swap chain image and present after.
+     */
+    void synchronizeWsi(PresenterSync sync) {
+      m_cmd->setWsiSemaphores(sync);
+    }
+
+    /**
+     * \brief Begins external rendering
+     *
+     * Invalidates all state and provides the caller
+     * with the objects necessary to start drawing.
+     * \returns Current command list object
+     */
+    Rc<DxvkCommandList> beginExternalRendering();
+
     /**
      * \brief Begins generating query data
      * \param [in] query The query to end
      */
     void beginQuery(
-      const Rc<DxvkGpuQuery>&   query);
+      const Rc<DxvkQuery>&      query);
     
     /**
      * \brief Ends generating query data
      * \param [in] query The query to end
      */
     void endQuery(
-      const Rc<DxvkGpuQuery>&   query);
+      const Rc<DxvkQuery>&      query);
     
     /**
      * \brief Sets render targets
@@ -92,26 +144,16 @@ namespace dxvk {
     void bindRenderTargets(
             DxvkRenderTargets&&   targets,
             VkImageAspectFlags    feedbackLoop) {
-      // Set up default render pass ops
-      m_state.om.renderTargets = std::move(targets);
+      if (likely(m_state.om.renderTargets != targets)) {
+        m_state.om.renderTargets = std::move(targets);
+        m_flags.set(DxvkContextFlag::GpDirtyRenderTargets);
+      }
 
       if (unlikely(m_state.gp.state.om.feedbackLoop() != feedbackLoop)) {
         m_state.gp.state.om.setFeedbackLoop(feedbackLoop);
-        m_flags.set(DxvkContextFlag::GpDirtyPipelineState);
-      }
 
-      this->resetRenderPassOps(
-        m_state.om.renderTargets,
-        m_state.om.renderPassOps);
-
-      if (!m_state.om.framebufferInfo.hasTargets(m_state.om.renderTargets)) {
-        // Create a new framebuffer object next
-        // time we start rendering something
-        m_flags.set(DxvkContextFlag::GpDirtyFramebuffer);
-      } else {
-        // Don't redundantly spill the render pass if
-        // the same render targets are bound again
-        m_flags.clr(DxvkContextFlag::GpDirtyFramebuffer);
+        m_flags.set(DxvkContextFlag::GpDirtyRenderTargets,
+                    DxvkContextFlag::GpDirtyPipelineState);
       }
     }
 
@@ -143,9 +185,6 @@ namespace dxvk {
     void bindIndexBuffer(
             DxvkBufferSlice&&     buffer,
             VkIndexType           indexType) {
-      if (!m_state.vi.indexBuffer.matchesBuffer(buffer))
-        m_vbTracked.clr(MaxNumVertexBindings);
-
       m_state.vi.indexBuffer = std::move(buffer);
       m_state.vi.indexType   = indexType;
 
@@ -184,12 +223,7 @@ namespace dxvk {
             VkShaderStageFlags    stages,
             uint32_t              slot,
             DxvkBufferSlice&&     buffer) {
-      bool needsUpdate = !m_rc[slot].bufferSlice.matchesBuffer(buffer);
-
-      if (likely(needsUpdate))
-        m_rcTracked.clr(slot);
-
-      m_rc[slot].bufferSlice = std::move(buffer);
+      m_uniformBuffers[slot] = std::move(buffer);
 
       m_descriptorState.dirtyBuffers(stages);
     }
@@ -205,7 +239,7 @@ namespace dxvk {
             uint32_t              slot,
             VkDeviceSize          offset,
             VkDeviceSize          length) {
-      m_rc[slot].bufferSlice.setRange(offset, length);
+      m_uniformBuffers[slot].setRange(offset, length);
 
       m_descriptorState.dirtyBuffers(stages);
     }
@@ -221,15 +255,12 @@ namespace dxvk {
             VkShaderStageFlags    stages,
             uint32_t              slot,
             Rc<DxvkImageView>&&   view) {
-      if (m_rc[slot].bufferView != nullptr) {
-        m_rc[slot].bufferSlice = DxvkBufferSlice();
-        m_rc[slot].bufferView  = nullptr;
+      if (likely(m_resources[slot].imageView != view || m_resources[slot].bufferView)) {
+        m_resources[slot].bufferView = nullptr;
+        m_resources[slot].imageView = std::move(view);
+
+        m_descriptorState.dirtyViews(stages);
       }
-
-      m_rc[slot].imageView = std::move(view);
-      m_rcTracked.clr(slot);
-
-      m_descriptorState.dirtyViews(stages);
     }
 
     /**
@@ -243,20 +274,12 @@ namespace dxvk {
             VkShaderStageFlags    stages,
             uint32_t              slot,
             Rc<DxvkBufferView>&&  view) {
-      if (m_rc[slot].imageView != nullptr)
-        m_rc[slot].imageView = nullptr;
+      if (likely(m_resources[slot].bufferView != view || m_resources[slot].imageView)) {
+        m_resources[slot].imageView = nullptr;
+        m_resources[slot].bufferView = std::move(view);
 
-      if (view != nullptr) {
-        m_rc[slot].bufferSlice = view->slice();
-        m_rc[slot].bufferView = std::move(view);
-      } else {
-        m_rc[slot].bufferSlice = DxvkBufferSlice();
-        m_rc[slot].bufferView = nullptr;
+        m_descriptorState.dirtyViews(stages);
       }
-
-      m_rcTracked.clr(slot);
-
-      m_descriptorState.dirtyViews(stages);
     }
 
     /**
@@ -272,10 +295,11 @@ namespace dxvk {
             VkShaderStageFlags    stages,
             uint32_t              slot,
             Rc<DxvkSampler>&&     sampler) {
-      m_rc[slot].sampler = std::move(sampler);
-      m_rcTracked.clr(slot);
+      if (likely(m_samplers[slot] != sampler)) {
+        m_samplers[slot] = std::move(sampler);
 
-      m_descriptorState.dirtyViews(stages);
+        m_descriptorState.dirtySamplers(stages);
+      }
     }
 
     /**
@@ -337,9 +361,6 @@ namespace dxvk {
             uint32_t              binding,
             DxvkBufferSlice&&     buffer,
             uint32_t              stride) {
-      if (!m_state.vi.vertexBuffers[binding].matchesBuffer(buffer))
-        m_vbTracked.clr(binding);
-
       m_state.vi.vertexBuffers[binding] = std::move(buffer);
       m_state.vi.vertexStrides[binding] = stride;
       m_flags.set(DxvkContextFlag::GpDirtyVertexBuffers);
@@ -384,19 +405,17 @@ namespace dxvk {
     /**
      * \brief Blits an image
      * 
-     * \param [in] dstImage Destination image
-     * \param [in] dstMapping Destination swizzle
-     * \param [in] srcImage Source image
-     * \param [in] srcMapping Source swizzle
-     * \param [in] region Blit region
+     * \param [in] dstView Destination image view
+     * \param [in] srcView Source image view
+     * \param [in] dstOffsets Two pixel coordinates in the destination image
+     * \param [in] srcOffsets Two pixel coordinates in the source image
      * \param [in] filter Texture filter
      */
-    void blitImage(
-      const Rc<DxvkImage>&        dstImage,
-      const VkComponentMapping&   dstMapping,
-      const Rc<DxvkImage>&        srcImage,
-      const VkComponentMapping&   srcMapping,
-      const VkImageBlit&          region,
+    void blitImageView(
+      const Rc<DxvkImageView>&    dstView,
+      const VkOffset3D*           dstOffsets,
+      const Rc<DxvkImageView>&    srcView,
+      const VkOffset3D*           srcOffsets,
             VkFilter              filter);
     
     /**
@@ -450,12 +469,14 @@ namespace dxvk {
      * \param [in] imageView Render target view to clear
      * \param [in] clearAspects Image aspects to clear
      * \param [in] clearValue The clear value
+     * \param [in] discardAspects Image aspects to discard
      */
     void clearRenderTarget(
       const Rc<DxvkImageView>&    imageView,
             VkImageAspectFlags    clearAspects,
-            VkClearValue          clearValue);
-    
+            VkClearValue          clearValue,
+            VkImageAspectFlags    discardAspects);
+
     /**
      * \brief Clears an image view
      * 
@@ -521,6 +542,8 @@ namespace dxvk {
      * \param [in] srcOffset Source offset, in bytes
      * \param [in] rowAlignment Row alignment, in bytes
      * \param [in] sliceAlignment Slice alignment, in bytes
+     * \param [in] srcFormat Buffer data format. May be
+     *    \c VK_FORMAT_UNKNOWN to use the image format.
      */
     void copyBufferToImage(
       const Rc<DxvkImage>&        dstImage,
@@ -530,7 +553,8 @@ namespace dxvk {
       const Rc<DxvkBuffer>&       srcBuffer,
             VkDeviceSize          srcOffset,
             VkDeviceSize          rowAlignment,
-            VkDeviceSize          sliceAlignment);
+            VkDeviceSize          sliceAlignment,
+            VkFormat              srcFormat);
     
     /**
      * \brief Copies data from one image to another
@@ -576,6 +600,7 @@ namespace dxvk {
      * \param [in] dstExtent Destination data extent
      * \param [in] rowAlignment Row alignment, in bytes
      * \param [in] sliceAlignment Slice alignment, in bytes
+     * \param [in] dstFormat Buffer format
      * \param [in] srcImage Source image
      * \param [in] srcSubresource Source subresource
      * \param [in] srcOffset Source area offset
@@ -586,38 +611,11 @@ namespace dxvk {
             VkDeviceSize          dstOffset,
             VkDeviceSize          rowAlignment,
             VkDeviceSize          sliceAlignment,
+            VkFormat              dstFormat,
       const Rc<DxvkImage>&        srcImage,
             VkImageSubresourceLayers srcSubresource,
             VkOffset3D            srcOffset,
             VkExtent3D            srcExtent);
-    
-    /**
-     * \brief Packs depth-stencil image data to a buffer
-     * 
-     * Packs data from both the depth and stencil aspects
-     * of an image into a buffer. The supported formats are:
-     * - \c VK_FORMAT_D24_UNORM_S8_UINT: 0xssdddddd
-     * - \c VK_FORMAT_D32_SFLOAT_S8_UINT: 0xdddddddd 0x000000ss
-     * \param [in] dstBuffer Destination buffer
-     * \param [in] dstBufferOffset Destination offset, in bytes
-     * \param [in] dstOffset Destination image offset
-     * \param [in] dstSize Destination image size
-     * \param [in] srcImage Source image
-     * \param [in] srcSubresource Source subresource
-     * \param [in] srcOffset Source area offset
-     * \param [in] srcExtent Source area size
-     * \param [in] format Packed data format
-     */
-    void copyDepthStencilImageToPackedBuffer(
-      const Rc<DxvkBuffer>&       dstBuffer,
-            VkDeviceSize          dstBufferOffset,
-            VkOffset2D            dstOffset,
-            VkExtent2D            dstExtent,
-      const Rc<DxvkImage>&        srcImage,
-            VkImageSubresourceLayers srcSubresource,
-            VkOffset2D            srcOffset,
-            VkExtent2D            srcExtent,
-            VkFormat              format);
     
     /**
      * \brief Copies image data stored in a linear buffer to another
@@ -646,33 +644,6 @@ namespace dxvk {
             VkExtent3D            srcSize,
             VkExtent3D            extent,
             VkDeviceSize          elementSize);
-
-    /**
-     * \brief Unpacks buffer data to a depth-stencil image
-     * 
-     * Writes the packed depth-stencil data to an image.
-     * See \ref copyDepthStencilImageToPackedBuffer for
-     * which formats are supported and how they are packed.
-     * \param [in] dstImage Destination image
-     * \param [in] dstSubresource Destination subresource
-     * \param [in] dstOffset Image area offset
-     * \param [in] dstExtent Image area size
-     * \param [in] srcBuffer Packed data buffer
-     * \param [in] srcBufferOffset Buffer offset of source image
-     * \param [in] srcOffset Offset into the source image
-     * \param [in] srcExtent Total size of the source image
-     * \param [in] format Packed data format
-     */
-    void copyPackedBufferToDepthStencilImage(
-      const Rc<DxvkImage>&        dstImage,
-            VkImageSubresourceLayers dstSubresource,
-            VkOffset2D            dstOffset,
-            VkExtent2D            dstExtent,
-      const Rc<DxvkBuffer>&       srcBuffer,
-            VkDeviceSize          srcBufferOffset,
-            VkOffset2D            srcOffset,
-            VkExtent2D            srcExtent,
-            VkFormat              format);
 
     /**
      * \brief Copies pages from a sparse resource to a buffer
@@ -705,19 +676,14 @@ namespace dxvk {
       const uint32_t*             pages,
       const Rc<DxvkBuffer>&       srcBuffer,
             VkDeviceSize          srcOffset);
-    
+
     /**
-     * \brief Discards contents of an image view
-     * 
-     * Discards the current contents of the image
-     * and performs a fast layout transition. This
-     * may improve performance in some cases.
-     * \param [in] imageView View to discard
-     * \param [in] discardAspects Image aspects to discard
+     * \brief Discards contents of an image
+     *
+     * \param [in] image Image to discard
      */
-    void discardImageView(
-      const Rc<DxvkImageView>&      imageView,
-            VkImageAspectFlags      discardAspects);
+    void discardImage(
+      const Rc<DxvkImage>&          image);
 
     /**
      * \brief Starts compute jobs
@@ -744,17 +710,13 @@ namespace dxvk {
     /**
      * \brief Draws primitive without using an index buffer
      * 
-     * \param [in] vertexCount Number of vertices to draw
-     * \param [in] instanceCount Number of instances to render
-     * \param [in] firstVertex First vertex in vertex buffer
-     * \param [in] firstInstance First instance ID
+     * \param [in] count Number of draws
+     * \param [in] draws Draw parameters
      */
     void draw(
-            uint32_t          vertexCount,
-            uint32_t          instanceCount,
-            uint32_t          firstVertex,
-            uint32_t          firstInstance);
-    
+            uint32_t          count,
+      const VkDrawIndirectCommand* draws);
+
     /**
      * \brief Indirect draw call
      * 
@@ -763,11 +725,14 @@ namespace dxvk {
      * \param [in] offset Draw buffer offset
      * \param [in] count Number of draws
      * \param [in] stride Stride between dispatch calls
+     * \param [in] unroll Whether to unroll multiple draws if
+     *    there are any potential data dependencies between them.
      */
     void drawIndirect(
             VkDeviceSize      offset,
             uint32_t          count,
-            uint32_t          stride);
+            uint32_t          stride,
+            bool              unroll);
     
     /**
      * \brief Indirect draw call
@@ -788,19 +753,13 @@ namespace dxvk {
     /**
      * \brief Draws primitives using an index buffer
      * 
-     * \param [in] indexCount Number of indices to draw
-     * \param [in] instanceCount Number of instances to render
-     * \param [in] firstIndex First index within the index buffer
-     * \param [in] vertexOffset Vertex ID that corresponds to index 0
-     * \param [in] firstInstance First instance ID
+     * \param [in] count Number of draws
+     * \param [in] draws Draw parameters
      */
     void drawIndexed(
-            uint32_t indexCount,
-            uint32_t instanceCount,
-            uint32_t firstIndex,
-            int32_t  vertexOffset,
-            uint32_t firstInstance);
-    
+            uint32_t          count,
+      const VkDrawIndexedIndirectCommand* draws);
+
     /**
      * \brief Indirect indexed draw call
      * 
@@ -809,12 +768,15 @@ namespace dxvk {
      * \param [in] offset Draw buffer offset
      * \param [in] count Number of draws
      * \param [in] stride Stride between dispatch calls
+     * \param [in] unroll Whether to unroll multiple draws if
+     *    there are any potential data dependencies between them.
      */
     void drawIndexedIndirect(
             VkDeviceSize      offset,
             uint32_t          count,
-            uint32_t          stride);
-    
+            uint32_t          stride,
+            bool              unroll);
+
     /**
      * \brief Indirect indexed draw call
      * 
@@ -832,14 +794,14 @@ namespace dxvk {
             uint32_t          stride);
     
     /**
-     * \brief Transform feddback draw call
-
-     * \param [in] counterBuffer Xfb counter buffer
+     * \brief Transform feedback draw call
+     *
+     * \param [in] counterOffset Draw count offset
      * \param [in] counterDivisor Vertex stride
      * \param [in] counterBias Counter bias
      */
     void drawIndirectXfb(
-      const DxvkBufferSlice&  counterBuffer,
+            VkDeviceSize      counterOffset,
             uint32_t          counterDivisor,
             uint32_t          counterBias);
     
@@ -930,12 +892,10 @@ namespace dxvk {
      * it to black unless the initial layout is preinitialized.
      * Only safe to call if the image is not in use by the GPU.
      * \param [in] image The image to initialize
-     * \param [in] subresources Image subresources
      * \param [in] initialLayout Initial image layout
      */
     void initImage(
       const Rc<DxvkImage>&            image,
-      const VkImageSubresourceRange&  subresources,
             VkImageLayout             initialLayout);
 
     /**
@@ -955,31 +915,83 @@ namespace dxvk {
      * backing resource. This allows the host to access
      * the buffer while the GPU is still accessing the
      * original backing resource.
-     * 
-     * \warning If the buffer is used by another context,
-     * invalidating it will result in undefined behaviour.
      * \param [in] buffer The buffer to invalidate
-     * \param [in] slice New buffer slice handle
+     * \param [in] slice New buffer slice
      */
     void invalidateBuffer(
       const Rc<DxvkBuffer>&           buffer,
-      const DxvkBufferSliceHandle&    slice);
+            Rc<DxvkResourceAllocation>&& slice);
+
+    /**
+     * \brief Ensures that buffer will not be relocated
+     *
+     * This guarantees that the buffer's GPU address remains the same
+     * throughout its lifetime. Only prevents implicit invalidation or
+     * relocation by the backend, client APIs must take care to respect
+     * this too.
+     * \param [in] buffer Buffer to lock in place
+     */
+    void ensureBufferAddress(
+      const Rc<DxvkBuffer>&           buffer);
+
+    /**
+     * \brief Invalidates image content
+     *
+     * Replaces the backing storage of an image.
+     * \param [in] buffer The buffer to invalidate
+     * \param [in] slice New buffer slice
+     */
+    void invalidateImage(
+      const Rc<DxvkImage>&            image,
+            Rc<DxvkResourceAllocation>&& slice);
     
     /**
-     * \brief Updates push constants
+     * \brief Invalidates image content and add usage flag
+     *
+     * Replaces the backing storage of an image.
+     * \param [in] buffer The buffer to invalidate
+     * \param [in] slice New buffer slice
+     * \param [in] usageInfo Added usage info
+     */
+    void invalidateImageWithUsage(
+      const Rc<DxvkImage>&            image,
+            Rc<DxvkResourceAllocation>&& slice,
+      const DxvkImageUsageInfo&       usageInfo);
+
+    /**
+     * \brief Ensures that an image supports the given usage
+     *
+     * No-op if the image already supports the requested properties.
+     * Otherwise, this will allocate a new backing resource with the
+     * requested properties and copy the current contents to it.
+     * \param [in] image Image resource
+     * \param [in] usageInfo Usage info to add
+     * \returns \c true if the image can support the given usage
+     */
+    bool ensureImageCompatibility(
+      const Rc<DxvkImage>&            image,
+      const DxvkImageUsageInfo&       usageInfo);
+
+    /**
+     * \brief Updates push data
      * 
-     * Updates the given push constant range.
+     * \param [in] stages Stage to set data for. If multiple
+     *    stages are set, this will push to the shared block.
      * \param [in] offset Byte offset of data to update
      * \param [in] size Number of bytes to update
      * \param [in] data Pointer to raw data
      */
-    void pushConstants(
+    void pushData(
+            VkShaderStageFlags        stages,
             uint32_t                  offset,
             uint32_t                  size,
       const void*                     data) {
-      std::memcpy(&m_state.pc.data[offset], data, size);
+      uint32_t index = DxvkPushDataBlock::computeIndex(stages);
 
-      m_flags.set(DxvkContextFlag::DirtyPushConstants);
+      uint32_t baseOffset = computePushDataBlockOffset(index);
+      std::memcpy(&m_state.pc.constantData[baseOffset + offset], data, size);
+
+      m_flags.set(DxvkContextFlag::DirtyPushData);
     }
 
     /**
@@ -995,27 +1007,15 @@ namespace dxvk {
      * \param [in] srcImage Source image
      * \param [in] region Region to resolve
      * \param [in] format Format for the resolve operation
+     * \param [in] mode Image resolve mode
+     * \param [in] stencilMode Stencil resolve mode
      */
     void resolveImage(
       const Rc<DxvkImage>&            dstImage,
       const Rc<DxvkImage>&            srcImage,
       const VkImageResolve&           region,
-            VkFormat                  format);
-    
-    /**
-     * \brief Resolves a multisampled depth-stencil resource
-     * 
-     * \param [in] dstImage Destination image
-     * \param [in] srcImage Source image
-     * \param [in] region Region to resolve
-     * \param [in] depthMode Resolve mode for depth aspect
-     * \param [in] stencilMode Resolve mode for stencil aspect
-     */
-    void resolveDepthStencilImage(
-      const Rc<DxvkImage>&            dstImage,
-      const Rc<DxvkImage>&            srcImage,
-      const VkImageResolve&           region,
-            VkResolveModeFlagBits     depthMode,
+            VkFormat                  format,
+            VkResolveModeFlagBits     mode,
             VkResolveModeFlagBits     stencilMode);
 
     /**
@@ -1048,67 +1048,49 @@ namespace dxvk {
       const void*                     data);
     
     /**
-     * \brief Updates an depth-stencil image
-     * 
-     * \param [in] image Destination image
-     * \param [in] subsresources Image subresources to update
-     * \param [in] imageOffset Offset of the image area to update
-     * \param [in] imageExtent Size of the image area to update
-     * \param [in] data Source data
-     * \param [in] pitchPerRow Row pitch of the source data
-     * \param [in] pitchPerLayer Layer pitch of the source data
-     * \param [in] format Packed depth-stencil format
-     */
-    void updateDepthStencilImage(
-      const Rc<DxvkImage>&            image,
-      const VkImageSubresourceLayers& subresources,
-            VkOffset2D                imageOffset,
-            VkExtent2D                imageExtent,
-      const void*                     data,
-            VkDeviceSize              pitchPerRow,
-            VkDeviceSize              pitchPerLayer,
-            VkFormat                  format);
-    
-    /**
      * \brief Uses transfer queue to initialize buffer
-     * 
-     * Only safe to use if the buffer is not in use by the GPU.
+     *
+     * Always replaces the entire buffer. Only safe to use
+     * if the buffer is currently not in use by the GPU.
      * \param [in] buffer The buffer to initialize
-     * \param [in] data The data to copy to the buffer
+     * \param [in] source Staging buffer containing data
+     * \param [in] sourceOffset Offset into staging buffer
      */
     void uploadBuffer(
       const Rc<DxvkBuffer>&           buffer,
-      const void*                     data);
+      const Rc<DxvkBuffer>&           source,
+            VkDeviceSize              sourceOffset);
     
     /**
      * \brief Uses transfer queue to initialize image
      * 
      * Only safe to use if the image is not in use by the GPU.
+     * Data for each subresource is tightly packed, but individual
+     * subresources must be aligned to \c subresourceAlignment in
+     * order to meet Vulkan requirements when using transfer queues.
      * \param [in] image The image to initialize
-     * \param [in] subresources Subresources to initialize
-     * \param [in] data Source data
-     * \param [in] pitchPerRow Row pitch of the source data
-     * \param [in] pitchPerLayer Layer pitch of the source data
+     * \param [in] source Staging buffer containing data
+     * \param [in] sourceOffset Offset into staging buffer
+     * \param [in] subresourceAlignment Subresource alignment
+     * \param [in] format Actual data format
      */
     void uploadImage(
       const Rc<DxvkImage>&            image,
-      const VkImageSubresourceLayers& subresources,
-      const void*                     data,
-            VkDeviceSize              pitchPerRow,
-            VkDeviceSize              pitchPerLayer);
-    
+      const Rc<DxvkBuffer>&           source,
+            VkDeviceSize              sourceOffset,
+            VkDeviceSize              subresourceAlignment,
+            VkFormat                  format);
+
     /**
      * \brief Sets viewports
      * 
      * \param [in] viewportCount Number of viewports
-     * \param [in] viewports The viewports
-     * \param [in] scissorRects Schissor rectangles
+     * \param [in] viewports The viewports and scissors
      */
     void setViewports(
             uint32_t            viewportCount,
-      const VkViewport*         viewports,
-      const VkRect2D*           scissorRects);
-    
+      const DxvkViewport*       viewports);
+
     /**
      * \brief Sets blend constants
      * 
@@ -1168,16 +1150,16 @@ namespace dxvk {
      * \brief Sets input layout
      * 
      * \param [in] attributeCount Number of vertex attributes
-     * \param [in] attributes The vertex attributes
+     * \param [in] attributes Array of attribute infos
      * \param [in] bindingCount Number of buffer bindings
-     * \param [in] bindings Vertex buffer bindigs
+     * \param [in] bindings Array of binding infos
      */
     void setInputLayout(
             uint32_t             attributeCount,
-      const DxvkVertexAttribute* attributes,
+      const DxvkVertexInput*     attributes,
             uint32_t             bindingCount,
-      const DxvkVertexBinding*   bindings);
-    
+      const DxvkVertexInput*     bindings);
+
     /**
      * \brief Sets rasterizer state
      * \param [in] rs New state object
@@ -1286,14 +1268,14 @@ namespace dxvk {
      * \param [in] event The event
      */
     void signalGpuEvent(
-      const Rc<DxvkGpuEvent>&   event);
+      const Rc<DxvkEvent>&      event);
     
     /**
      * \brief Writes to a timestamp query
      * \param [in] query The timestamp query
      */
     void writeTimestamp(
-      const Rc<DxvkGpuQuery>&   query);
+      const Rc<DxvkQuery>&      query);
     
     /**
      * \brief Queues a signal
@@ -1330,12 +1312,12 @@ namespace dxvk {
 
     /**
      * \brief Begins a debug label region
-     * \param [in] label The debug label
      *
      * Marks the start of a debug label region. Used by debugging/profiling
      * tools to mark different workloads within a frame.
+     * \param [in] label The debug label
      */
-    void beginDebugLabel(VkDebugUtilsLabelEXT *label);
+    void beginDebugLabel(const VkDebugUtilsLabelEXT& label);
 
     /**
      * \brief Ends a debug label region
@@ -1347,21 +1329,12 @@ namespace dxvk {
 
     /**
      * \brief Inserts a debug label
-     * \param [in] label The debug label
      *
      * Inserts an instantaneous debug label. Used by debugging/profiling
      * tools to mark different workloads within a frame.
+     * \param [in] label The debug label
      */
-    void insertDebugLabel(VkDebugUtilsLabelEXT *label);
-
-    /**
-     * \brief Inserts a marker object
-     * \param [in] marker The marker
-     */
-    template<typename T>
-    void insertMarker(const Rc<DxvkMarker<T>>& marker) {
-      m_cmd->trackResource<DxvkAccess::Write>(marker);
-    }
+    void insertDebugLabel(const VkDebugUtilsLabelEXT& label);
 
     /**
      * \brief Increments a given stat counter
@@ -1376,11 +1349,21 @@ namespace dxvk {
         m_cmd->addStatCtr(counter, value);
     }
 
+    /**
+     * \brief Sets new debug name for a resource
+     *
+     * \param [in] buffer Buffer object
+     * \param [in] name New debug name, or \c nullptr
+     */
+    void setDebugName(const Rc<DxvkPagedResource>& resource, const char* name);
+
   private:
     
     Rc<DxvkDevice>          m_device;
-    DxvkContextType         m_type;
     DxvkObjects*            m_common;
+
+    uint64_t                m_trackingId = 0u;
+    uint32_t                m_renderPassIndex = 0u;
     
     Rc<DxvkCommandList>     m_cmd;
     Rc<DxvkBuffer>          m_zeroBuffer;
@@ -1391,46 +1374,64 @@ namespace dxvk {
     DxvkDescriptorState     m_descriptorState;
 
     Rc<DxvkDescriptorPool>  m_descriptorPool;
-    Rc<DxvkDescriptorManager> m_descriptorManager;
+    Rc<DxvkDescriptorPoolSet> m_descriptorManager;
 
-    DxvkBarrierSet          m_sdmaAcquires;
-    DxvkBarrierSet          m_sdmaBarriers;
-    DxvkBarrierSet          m_initBarriers;
-    DxvkBarrierSet          m_execAcquires;
-    DxvkBarrierSet          m_execBarriers;
+    Rc<DxvkResourceDescriptorHeap> m_descriptorHeap;
+
+    DxvkBarrierBatch        m_sdmaAcquires;
+    DxvkBarrierBatch        m_sdmaBarriers;
+    DxvkBarrierBatch        m_initAcquires;
+    DxvkBarrierBatch        m_initBarriers;
+    DxvkBarrierBatch        m_execBarriers;
+    DxvkBarrierTracker      m_barrierTracker;
     DxvkBarrierControlFlags m_barrierControl;
 
     DxvkGpuQueryManager     m_queryManager;
-    DxvkStagingBuffer       m_staging;
-    
-    DxvkGlobalPipelineBarrier m_globalRoGraphicsBarrier;
-    DxvkGlobalPipelineBarrier m_globalRwGraphicsBarrier;
+
+    DxvkGlobalPipelineBarrier m_renderPassBarrierSrc = { };
+    DxvkGlobalPipelineBarrier m_renderPassBarrierDst = { };
 
     DxvkRenderTargetLayouts m_rtLayouts = { };
 
-    DxvkBindingSet<MaxNumVertexBindings + 1>  m_vbTracked;
-    DxvkBindingSet<MaxNumResourceSlots>       m_rcTracked;
-
     std::vector<DxvkDeferredClear> m_deferredClears;
+    std::array<DxvkDeferredResolve, MaxNumRenderTargets + 1u> m_deferredResolves = { };
 
-    std::vector<VkWriteDescriptorSet> m_descriptorWrites;
-    std::vector<DxvkDescriptorInfo>   m_descriptors;
+    struct {
+      std::vector<VkWriteDescriptorSet> writes;
+      std::vector<DxvkLegacyDescriptor> infos;
+    } m_legacyDescriptors;
 
-    std::array<DxvkShaderResourceSlot, MaxNumResourceSlots>  m_rc;
+    std::array<Rc<DxvkSampler>, MaxNumSamplerSlots> m_samplers;
+    std::array<DxvkBufferSlice, MaxNumUniformBufferSlots> m_uniformBuffers;
+    std::array<DxvkViewPair, MaxNumResourceSlots> m_resources;
+
     std::array<DxvkGraphicsPipeline*, 4096> m_gpLookupCache = { };
     std::array<DxvkComputePipeline*,   256> m_cpLookupCache = { };
 
+    std::vector<VkImageMemoryBarrier2> m_imageLayoutTransitions;
+
+    std::vector<util::DxvkDebugLabel> m_debugLabelStack;
+
+    DxvkDescriptorCopyWorker m_descriptorWorker;
+
+    Rc<DxvkLatencyTracker>  m_latencyTracker;
+    uint64_t                m_latencyFrameId = 0u;
+    bool                    m_endLatencyTracking = false;
+
+    DxvkImplicitResolveTracker  m_implicitResolves;
+
     void blitImageFb(
-      const Rc<DxvkImage>&        dstImage,
-      const Rc<DxvkImage>&        srcImage,
-      const VkImageBlit&          region,
-      const VkComponentMapping&   mapping,
+            Rc<DxvkImageView>     dstView,
+      const VkOffset3D*           dstOffsets,
+            Rc<DxvkImageView>     srcView,
+      const VkOffset3D*           srcOffsets,
             VkFilter              filter);
 
     void blitImageHw(
-      const Rc<DxvkImage>&        dstImage,
-      const Rc<DxvkImage>&        srcImage,
-      const VkImageBlit&          region,
+      const Rc<DxvkImageView>&    dstView,
+      const VkOffset3D*           dstOffsets,
+      const Rc<DxvkImageView>&    srcView,
+      const VkOffset3D*           srcOffsets,
             VkFilter              filter);
 
     template<bool ToImage>
@@ -1441,19 +1442,51 @@ namespace dxvk {
             VkOffset3D            imageOffset,
             VkExtent3D            imageExtent,
             VkImageLayout         imageLayout,
-      const DxvkBufferSliceHandle& bufferSlice,
+      const DxvkResourceBufferInfo& bufferSlice,
             VkDeviceSize          bufferRowAlignment,
             VkDeviceSize          bufferSliceAlignment);
 
-    void copyImageHostData(
-            DxvkCmdBuffer         cmd,
+    void copyBufferToImageHw(
       const Rc<DxvkImage>&        image,
       const VkImageSubresourceLayers& imageSubresource,
             VkOffset3D            imageOffset,
             VkExtent3D            imageExtent,
-      const void*                 hostData,
-            VkDeviceSize          rowPitch,
-            VkDeviceSize          slicePitch);
+      const Rc<DxvkBuffer>&       buffer,
+            VkDeviceSize          bufferOffset,
+            VkDeviceSize          bufferRowAlignment,
+            VkDeviceSize          bufferSliceAlignment);
+
+    void copyBufferToImageFb(
+      const Rc<DxvkImage>&        image,
+      const VkImageSubresourceLayers& imageSubresource,
+            VkOffset3D            imageOffset,
+            VkExtent3D            imageExtent,
+      const Rc<DxvkBuffer>&       buffer,
+            VkDeviceSize          bufferOffset,
+            VkDeviceSize          bufferRowAlignment,
+            VkDeviceSize          bufferSliceAlignment,
+            VkFormat              bufferFormat);
+
+    void copyImageToBufferHw(
+      const Rc<DxvkBuffer>&       buffer,
+            VkDeviceSize          bufferOffset,
+            VkDeviceSize          bufferRowAlignment,
+            VkDeviceSize          bufferSliceAlignment,
+      const Rc<DxvkImage>&        image,
+            VkImageSubresourceLayers imageSubresource,
+            VkOffset3D            imageOffset,
+            VkExtent3D            imageExtent);
+
+    void copyImageToBufferCs(
+      const Rc<DxvkBuffer>&       buffer,
+            VkDeviceSize          bufferOffset,
+            VkDeviceSize          bufferRowAlignment,
+            VkDeviceSize          bufferSliceAlignment,
+            VkFormat              bufferFormat,
+      const Rc<DxvkImage>&        image,
+            VkImageSubresourceLayers imageSubresource,
+            VkOffset3D            imageOffset,
+            VkExtent3D            imageExtent);
 
     void clearImageViewFb(
       const Rc<DxvkImageView>&    imageView,
@@ -1484,17 +1517,6 @@ namespace dxvk {
       const Rc<DxvkImage>&        srcImage,
             VkImageSubresourceLayers srcSubresource,
             VkOffset3D            srcOffset,
-            VkExtent3D            extent);
-    
-    void copyImageFbDirect(
-      const Rc<DxvkImage>&        dstImage,
-            VkImageSubresourceLayers dstSubresource,
-            VkOffset3D            dstOffset,
-            VkFormat              dstFormat,
-      const Rc<DxvkImage>&        srcImage,
-            VkImageSubresourceLayers srcSubresource,
-            VkOffset3D            srcOffset,
-            VkFormat              srcFormat,
             VkExtent3D            extent);
 
     bool copyImageClear(
@@ -1529,18 +1551,38 @@ namespace dxvk {
       const Rc<DxvkBuffer>&       buffer,
             VkDeviceSize          offset);
 
+    template<bool Indexed, typename T>
+    void drawGeneric(
+            uint32_t              count,
+      const T*                    draws);
+
+    template<bool Indexed>
+    void drawIndirectGeneric(
+            VkDeviceSize          offset,
+            uint32_t              count,
+            uint32_t              stride,
+            bool                  unroll);
+
+    template<bool Indexed>
+    void drawIndirectCountGeneric(
+            VkDeviceSize          offset,
+            VkDeviceSize          countOffset,
+            uint32_t              maxCount,
+            uint32_t              stride);
+
     void resolveImageHw(
       const Rc<DxvkImage>&            dstImage,
       const Rc<DxvkImage>&            srcImage,
       const VkImageResolve&           region);
     
-    void resolveImageDs(
+    void resolveImageRp(
       const Rc<DxvkImage>&            dstImage,
       const Rc<DxvkImage>&            srcImage,
       const VkImageResolve&           region,
-            VkResolveModeFlagBits     depthMode,
+            VkFormat                  format,
+            VkResolveModeFlagBits     mode,
             VkResolveModeFlagBits     stencilMode);
-    
+
     void resolveImageFb(
       const Rc<DxvkImage>&            dstImage,
       const Rc<DxvkImage>&            srcImage,
@@ -1548,15 +1590,34 @@ namespace dxvk {
             VkFormat                  format,
             VkResolveModeFlagBits     depthMode,
             VkResolveModeFlagBits     stencilMode);
-    
-    void resolveImageFbDirect(
+
+    bool resolveImageClear(
+      const Rc<DxvkImage>&            dstImage,
+      const Rc<DxvkImage>&            srcImage,
+      const VkImageResolve&           region,
+            VkFormat                  format);
+
+    bool resolveImageInline(
       const Rc<DxvkImage>&            dstImage,
       const Rc<DxvkImage>&            srcImage,
       const VkImageResolve&           region,
             VkFormat                  format,
             VkResolveModeFlagBits     depthMode,
             VkResolveModeFlagBits     stencilMode);
-    
+
+    void uploadImageFb(
+      const Rc<DxvkImage>&            image,
+      const Rc<DxvkBuffer>&           source,
+            VkDeviceSize              sourceOffset,
+            VkDeviceSize              subresourceAlignment,
+            VkFormat                  format);
+
+    void uploadImageHw(
+      const Rc<DxvkImage>&            image,
+      const Rc<DxvkBuffer>&           source,
+            VkDeviceSize              subresourceAlignment,
+            VkDeviceSize              sourceOffset);
+
     void performClear(
       const Rc<DxvkImageView>&        imageView,
             int32_t                   attachmentIndex,
@@ -1573,10 +1634,31 @@ namespace dxvk {
       const Rc<DxvkImageView>&        imageView,
             VkImageAspectFlags        discardAspects);
 
+    void preparePostRenderPassClears();
+
+    void hoistInlineClear(
+            DxvkDeferredClear&        clear,
+            VkRenderingAttachmentInfo& attachment,
+            VkImageAspectFlagBits     aspect);
+
+    void flushClearsInline();
+
     void flushClears(
             bool                      useRenderPass);
 
     void flushSharedImages();
+
+    void flushRenderPassDiscards();
+
+    void flushRenderPassResolves();
+
+    void flushResolves();
+
+    void finalizeLoadStoreOps();
+
+    void adjustAttachmentLoadStoreOps(
+            VkRenderingAttachmentInfo&  attachment,
+            DxvkAccess                  access) const;
 
     void startRenderPass();
     void spillRenderPass(bool suspend);
@@ -1607,7 +1689,9 @@ namespace dxvk {
     
     void unbindGraphicsPipeline();
     bool updateGraphicsPipeline();
-    bool updateGraphicsPipelineState(DxvkGlobalPipelineBarrier srcBarrier);
+    bool updateGraphicsPipelineState();
+
+    uint32_t getGraphicsPipelineDebugColor() const;
 
     template<VkPipelineBindPoint BindPoint>
     void resetSpecConstants(
@@ -1619,15 +1703,27 @@ namespace dxvk {
     void invalidateState();
 
     template<VkPipelineBindPoint BindPoint>
-    void updateResourceBindings(const DxvkBindingLayoutObjects* layout);
+    void updateSamplerSet(const DxvkPipelineLayout* layout);
+
+    template<VkPipelineBindPoint BindPoint>
+    bool updateResourceBindings(const DxvkPipelineBindings* layout);
+
+    template<VkPipelineBindPoint BindPoint>
+    void updateDescriptorSetsBindings(const DxvkPipelineBindings* layout);
+
+    template<VkPipelineBindPoint BindPoint>
+    bool updateDescriptorBufferBindings(const DxvkPipelineBindings* layout);
+
+    template<VkPipelineBindPoint BindPoint>
+    void updatePushDataBindings(const DxvkPipelineBindings* layout);
 
     void updateComputeShaderResources();
-    void updateGraphicsShaderResources();
+    bool updateGraphicsShaderResources();
 
     DxvkFramebufferInfo makeFramebufferInfo(
       const DxvkRenderTargets&      renderTargets);
 
-    void updateFramebuffer();
+    void updateRenderTargets();
     
     void applyRenderTargetLoadLayouts();
 
@@ -1653,7 +1749,15 @@ namespace dxvk {
       const VkImageSubresourceRange& subresources,
             bool                    flushClears = true);
 
-    bool updateIndexBufferBinding();
+    DxvkDeferredClear* findDeferredClear(
+      const Rc<DxvkImage>&          image,
+      const VkImageSubresourceRange& subresources);
+
+    DxvkDeferredClear* findOverlappingDeferredClear(
+      const Rc<DxvkImage>&          image,
+      const VkImageSubresourceRange& subresources);
+
+    void updateIndexBufferBinding();
     void updateVertexBufferBindings();
 
     void updateTransformFeedbackBuffers();
@@ -1662,53 +1766,95 @@ namespace dxvk {
     void updateDynamicState();
 
     template<VkPipelineBindPoint BindPoint>
-    void updatePushConstants();
+    void updatePushData();
     
+    template<bool Resolve = true>
     bool commitComputeState();
     
-    template<bool Indexed, bool Indirect>
+    template<bool Indexed, bool Indirect, bool Resolve = true>
     bool commitGraphicsState();
     
-    template<bool DoEmit>
-    void commitComputeBarriers();
+    template<VkPipelineBindPoint BindPoint>
+    bool checkResourceHazards(
+      const DxvkPipelineBindings*     layout);
 
-    void commitComputePostBarriers();
-    
-    template<bool Indexed, bool Indirect, bool DoEmit>
-    void commitGraphicsBarriers();
+    bool checkComputeHazards();
 
-    template<bool DoEmit>
+    template<bool Indexed, bool Indirect>
+    bool checkGraphicsHazards();
+
+    template<VkPipelineBindPoint BindPoint>
     bool checkBufferBarrier(
       const DxvkBufferSlice&          bufferSlice,
-            VkPipelineStageFlags      stages,
-            VkAccessFlags             access);
+            VkAccessFlags             access,
+            DxvkAccessOp              accessOp);
 
-    template<bool DoEmit>
+    template<VkPipelineBindPoint BindPoint>
     bool checkBufferViewBarrier(
       const Rc<DxvkBufferView>&       bufferView,
-            VkPipelineStageFlags      stages,
-            VkAccessFlags             access);
+            VkAccessFlags             access,
+            DxvkAccessOp              accessOp);
 
-    template<bool DoEmit>
+    template<VkPipelineBindPoint BindPoint>
     bool checkImageViewBarrier(
       const Rc<DxvkImageView>&        imageView,
-            VkPipelineStageFlags      stages,
-            VkAccessFlags             access);
+            VkAccessFlags             access,
+            DxvkAccessOp              accessOp);
 
-    bool canIgnoreWawHazards(
-            VkPipelineStageFlags      stages);
+    template<VkPipelineBindPoint BindPoint>
+    DxvkAccessFlags getAllowedStorageHazards() {
+      if (m_barrierControl.isClear() || m_flags.test(DxvkContextFlag::ForceWriteAfterWriteSync))
+        return DxvkAccessFlags();
+
+      if constexpr (BindPoint == VK_PIPELINE_BIND_POINT_COMPUTE) {
+        // If there are any pending accesses that are not directly related
+        // to shader dispatches, always insert a barrier if there is a hazard.
+        VkPipelineStageFlags2 stageMask = VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT
+                                        | VK_PIPELINE_STAGE_2_DRAW_INDIRECT_BIT;
+
+        if (!m_execBarriers.hasPendingStages(~stageMask)) {
+          if (m_barrierControl.test(DxvkBarrierControl::ComputeAllowReadWriteOverlap))
+            return DxvkAccessFlags(DxvkAccess::Write, DxvkAccess::Read);
+          else if (m_barrierControl.test(DxvkBarrierControl::ComputeAllowWriteOnlyOverlap))
+            return DxvkAccessFlags(DxvkAccess::Write);
+        }
+      } else {
+        // For graphics, the only type of unrelated access we have to worry about
+        // is transform feedback writes, in which case inserting a barrier is fine.
+        if (m_barrierControl.test(DxvkBarrierControl::GraphicsAllowReadWriteOverlap))
+          return DxvkAccessFlags(DxvkAccess::Write, DxvkAccess::Read);
+      }
+
+      return DxvkAccessFlags();
+    }
+
 
     void emitMemoryBarrier(
             VkPipelineStageFlags      srcStages,
             VkAccessFlags             srcAccess,
             VkPipelineStageFlags      dstStages,
             VkAccessFlags             dstAccess);
-    
+
     void trackDrawBuffer();
 
     bool tryInvalidateDeviceLocalBuffer(
       const Rc<DxvkBuffer>&           buffer,
             VkDeviceSize              copySize);
+
+    Rc<DxvkImageView> ensureImageViewCompatibility(
+      const Rc<DxvkImageView>&        view,
+            VkImageUsageFlagBits      usage);
+
+    void relocateResources(
+            size_t                    bufferCount,
+      const DxvkRelocateBufferInfo*   bufferInfos,
+            size_t                    imageCount,
+      const DxvkRelocateImageInfo*    imageInfos);
+
+    void relocateQueuedResources();
+
+    Rc<DxvkSampler> createBlitSampler(
+            VkFilter                  filter);
 
     DxvkGraphicsPipeline* lookupGraphicsPipeline(
       const DxvkGraphicsPipelineShaders&  shaders);
@@ -1719,14 +1865,380 @@ namespace dxvk {
     Rc<DxvkBuffer> createZeroBuffer(
             VkDeviceSize              size);
 
+    void freeZeroBuffer();
+
     void resizeDescriptorArrays(
             uint32_t                  bindingCount);
+
+    void flushImplicitResolves();
 
     void beginCurrentCommands();
 
     void endCurrentCommands();
 
     void splitCommands();
+
+    void discardRenderTarget(
+      const DxvkImage&                image,
+      const VkImageSubresourceRange&  subresources);
+
+    void flushImageLayoutTransitions(
+            DxvkCmdBuffer             cmdBuffer);
+
+    void addImageLayoutTransition(
+            DxvkImage&                image,
+      const VkImageSubresourceRange&  subresources,
+            VkImageLayout             srcLayout,
+            VkPipelineStageFlags2     srcStages,
+            VkAccessFlags2            srcAccess,
+            VkImageLayout             dstLayout,
+            VkPipelineStageFlags2     dstStages,
+            VkAccessFlags2            dstAccess);
+
+    void addImageLayoutTransition(
+            DxvkImage&                image,
+      const VkImageSubresourceRange&  subresources,
+            VkImageLayout             dstLayout,
+            VkPipelineStageFlags2     dstStages,
+            VkAccessFlags2            dstAccess,
+            bool                      discard);
+
+    void addImageInitTransition(
+            DxvkImage&                image,
+      const VkImageSubresourceRange&  subresources,
+            VkImageLayout             dstLayout,
+            VkPipelineStageFlags2     dstStages,
+            VkAccessFlags2            dstAccess);
+
+    void accessMemory(
+            DxvkCmdBuffer             cmdBuffer,
+            VkPipelineStageFlags2     srcStages,
+            VkAccessFlags2            srcAccess,
+            VkPipelineStageFlags2     dstStages,
+            VkAccessFlags2            dstAccess);
+
+    void accessImage(
+            DxvkCmdBuffer             cmdBuffer,
+            DxvkImage&                image,
+      const VkImageSubresourceRange&  subresources,
+            VkImageLayout             srcLayout,
+            VkPipelineStageFlags2     srcStages,
+            VkAccessFlags2            srcAccess,
+            DxvkAccessOp              accessOp);
+
+    void accessImage(
+            DxvkCmdBuffer             cmdBuffer,
+      const DxvkImageView&            imageView,
+            VkPipelineStageFlags2     srcStages,
+            VkAccessFlags2            srcAccess,
+            DxvkAccessOp              accessOp);
+
+    void accessImage(
+            DxvkCmdBuffer             cmdBuffer,
+            DxvkImage&                image,
+      const VkImageSubresourceRange&  subresources,
+            VkImageLayout             srcLayout,
+            VkPipelineStageFlags2     srcStages,
+            VkAccessFlags2            srcAccess,
+            VkImageLayout             dstLayout,
+            VkPipelineStageFlags2     dstStages,
+            VkAccessFlags2            dstAccess,
+            DxvkAccessOp              accessOp);
+
+    void accessImageRegion(
+            DxvkCmdBuffer             cmdBuffer,
+            DxvkImage&                image,
+      const VkImageSubresourceLayers& subresources,
+            VkOffset3D                offset,
+            VkExtent3D                extent,
+            VkImageLayout             srcLayout,
+            VkPipelineStageFlags2     srcStages,
+            VkAccessFlags2            srcAccess,
+            DxvkAccessOp              accessOp);
+
+    void accessImageRegion(
+            DxvkCmdBuffer             cmdBuffer,
+            DxvkImage&                image,
+      const VkImageSubresourceLayers& subresources,
+            VkOffset3D                offset,
+            VkExtent3D                extent,
+            VkImageLayout             srcLayout,
+            VkPipelineStageFlags2     srcStages,
+            VkAccessFlags2            srcAccess,
+            VkImageLayout             dstLayout,
+            VkPipelineStageFlags2     dstStages,
+            VkAccessFlags2            dstAccess,
+            DxvkAccessOp              accessOp);
+
+    void accessImageTransfer(
+            DxvkImage&                image,
+      const VkImageSubresourceRange&  subresources,
+            VkImageLayout             srcLayout,
+            VkPipelineStageFlags2     srcStages,
+            VkAccessFlags2            srcAccess);
+
+    void accessBuffer(
+            DxvkCmdBuffer             cmdBuffer,
+            DxvkBuffer&               buffer,
+            VkDeviceSize              offset,
+            VkDeviceSize              size,
+            VkPipelineStageFlags2     srcStages,
+            VkAccessFlags2            srcAccess,
+            DxvkAccessOp              accessOp);
+
+    void accessBuffer(
+            DxvkCmdBuffer             cmdBuffer,
+            DxvkBuffer&               buffer,
+            VkDeviceSize              offset,
+            VkDeviceSize              size,
+            VkPipelineStageFlags2     srcStages,
+            VkAccessFlags2            srcAccess,
+            VkPipelineStageFlags2     dstStages,
+            VkAccessFlags2            dstAccess,
+            DxvkAccessOp              accessOp);
+
+    void accessBuffer(
+            DxvkCmdBuffer             cmdBuffer,
+      const DxvkBufferSlice&          bufferSlice,
+            VkPipelineStageFlags2     srcStages,
+            VkAccessFlags2            srcAccess,
+            DxvkAccessOp              accessOp);
+
+    void accessBuffer(
+            DxvkCmdBuffer             cmdBuffer,
+      const DxvkBufferSlice&          bufferSlice,
+            VkPipelineStageFlags2     srcStages,
+            VkAccessFlags2            srcAccess,
+            VkPipelineStageFlags2     dstStages,
+            VkAccessFlags2            dstAccess,
+            DxvkAccessOp              accessOp);
+
+    void accessBuffer(
+            DxvkCmdBuffer             cmdBuffer,
+            DxvkBufferView&           bufferView,
+            VkPipelineStageFlags2     srcStages,
+            VkAccessFlags2            srcAccess,
+            DxvkAccessOp              accessOp);
+
+    void accessBuffer(
+            DxvkCmdBuffer             cmdBuffer,
+            DxvkBufferView&           bufferView,
+            VkPipelineStageFlags2     srcStages,
+            VkAccessFlags2            srcAccess,
+            VkPipelineStageFlags2     dstStages,
+            VkAccessFlags2            dstAccess,
+            DxvkAccessOp              accessOp);
+
+    void accessBufferTransfer(
+            DxvkBuffer&               buffer,
+            VkPipelineStageFlags2     srcStages,
+            VkAccessFlags2            srcAccess);
+
+    void accessDrawBuffer(
+            VkDeviceSize              offset,
+            uint32_t                  count,
+            uint32_t                  stride,
+            uint32_t                  size);
+
+    void accessDrawCountBuffer(
+            VkDeviceSize              offset);
+
+    void flushPendingAccesses(
+            DxvkBuffer&               buffer,
+            VkDeviceSize              offset,
+            VkDeviceSize              size,
+            DxvkAccess                access);
+
+    void flushPendingAccesses(
+            DxvkBufferView&           bufferView,
+            DxvkAccess                access);
+
+    void flushPendingAccesses(
+            DxvkImage&                image,
+      const VkImageSubresourceRange&  subresources,
+            DxvkAccess                access);
+
+    void flushPendingAccesses(
+            DxvkImage&                image,
+      const VkImageSubresourceLayers& subresources,
+            VkOffset3D                offset,
+            VkExtent3D                extent,
+            DxvkAccess                access);
+
+    void flushPendingAccesses(
+            DxvkImageView&            imageView,
+            DxvkAccess                access);
+
+    void flushBarriers();
+
+    bool resourceHasAccess(
+            DxvkBuffer&               buffer,
+            VkDeviceSize              offset,
+            VkDeviceSize              size,
+            DxvkAccess                access,
+            DxvkAccessOp              accessOp);
+
+    bool resourceHasAccess(
+            DxvkBufferView&           bufferView,
+            DxvkAccess                access,
+            DxvkAccessOp              accessOp);
+
+    bool resourceHasAccess(
+            DxvkImage&                image,
+      const VkImageSubresourceRange&  subresources,
+            DxvkAccess                access,
+            DxvkAccessOp              accessOp);
+
+    bool resourceHasAccess(
+            DxvkImage&                image,
+      const VkImageSubresourceLayers& subresources,
+            VkOffset3D                offset,
+            VkExtent3D                extent,
+            DxvkAccess                access,
+            DxvkAccessOp              accessOp);
+
+    bool resourceHasAccess(
+            DxvkImageView&            imageView,
+            DxvkAccess                access,
+            DxvkAccessOp              accessOp);
+
+    DxvkBarrierBatch& getBarrierBatch(
+            DxvkCmdBuffer             cmdBuffer);
+
+    bool prepareOutOfOrderTransfer(
+      const Rc<DxvkBuffer>&           buffer,
+            VkDeviceSize              offset,
+            VkDeviceSize              size,
+            DxvkAccess                access);
+
+    bool prepareOutOfOrderTransfer(
+      const Rc<DxvkBufferView>&       bufferView,
+            VkDeviceSize              offset,
+            VkDeviceSize              size,
+            DxvkAccess                access);
+
+    bool prepareOutOfOrderTransfer(
+      const Rc<DxvkImage>&            image,
+            DxvkAccess                access);
+
+    template<VkPipelineBindPoint BindPoint, typename Pred>
+    bool checkResourceBarrier(
+      const Pred&                     pred,
+            VkAccessFlags             access) {
+      // If we're only reading the resource, only pending
+      // writes matter for synchronization purposes.
+      bool hasPendingWrite = pred(DxvkAccess::Write);
+
+      if (!(access & vk::AccessWriteMask))
+        return hasPendingWrite;
+
+      if (hasPendingWrite) {
+        // If there is a write-after-write hazard and synchronization
+        // for those is not explicitly disabled, insert a barrier.
+        DxvkAccessFlags allowedHazards = getAllowedStorageHazards<BindPoint>();
+
+        if (!allowedHazards.test(DxvkAccess::Write))
+          return true;
+
+        // Skip barrier if overlapping read-modify-write ops are allowed.
+        // This includes shader atomics, but also non-atomic load-stores.
+        if (allowedHazards.test(DxvkAccess::Read))
+          return false;
+
+        // Otherwise, check if there is a read-after-write hazard.
+        if (access & vk::AccessReadMask)
+          return true;
+      }
+
+      // Check if there are any pending reads to avoid write-after-read issues.
+      return pred(DxvkAccess::Read);
+    }
+
+    DxvkPipelineLayoutType getActivePipelineLayoutType(VkPipelineBindPoint bindPoint) const {
+      return (bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS && m_flags.test(DxvkContextFlag::GpIndependentSets))
+        ? DxvkPipelineLayoutType::Independent
+        : DxvkPipelineLayoutType::Merged;
+    }
+
+    bool needsDrawBarriers();
+
+    void beginRenderPassDebugRegion();
+
+    template<VkPipelineBindPoint BindPoint>
+    void beginBarrierControlDebugRegion();
+
+    void pushDebugRegion(
+      const VkDebugUtilsLabelEXT&       label,
+            util::DxvkDebugLabelType    type);
+
+    void popDebugRegion(
+            util::DxvkDebugLabelType    type);
+
+    bool hasDebugRegion(
+            util::DxvkDebugLabelType    type);
+
+    void beginActiveDebugRegions();
+
+    void endActiveDebugRegions();
+
+    void submitDescriptorPool(bool endFrame);
+
+    template<VkPipelineBindPoint BindPoint>
+    force_inline void trackUniformBufferBinding(const DxvkShaderDescriptor& binding, const DxvkBufferSlice& slice) {
+      if (BindPoint == VK_PIPELINE_BIND_POINT_COMPUTE || unlikely(slice.buffer()->hasGfxStores())) {
+        accessBuffer(DxvkCmdBuffer::ExecBuffer, slice,
+          util::pipelineStages(binding.getStageMask()), binding.getAccess(), DxvkAccessOp::None);
+      }
+
+      m_cmd->track(slice.buffer(), DxvkAccess::Read);
+    }
+
+    template<VkPipelineBindPoint BindPoint, bool IsWritable>
+    force_inline void trackBufferViewBinding(const DxvkShaderDescriptor& binding, DxvkBufferView& view) {
+      DxvkAccessOp accessOp = IsWritable ? binding.getAccessOp() : DxvkAccessOp::None;
+
+      if (BindPoint == VK_PIPELINE_BIND_POINT_COMPUTE || unlikely(view.buffer()->hasGfxStores())) {
+        accessBuffer(DxvkCmdBuffer::ExecBuffer, view,
+          util::pipelineStages(binding.getStageMask()), binding.getAccess(), accessOp);
+      }
+
+      DxvkAccess access = IsWritable && (binding.getAccess() & vk::AccessWriteMask)
+        ? DxvkAccess::Write : DxvkAccess::Read;
+      m_cmd->track(view.buffer(), access);
+    }
+
+    template<VkPipelineBindPoint BindPoint, bool IsWritable>
+    force_inline void trackImageViewBinding(const DxvkShaderDescriptor& binding, DxvkImageView& view) {
+      DxvkAccessOp accessOp = IsWritable ? binding.getAccessOp() : DxvkAccessOp::None;
+
+      if (BindPoint == VK_PIPELINE_BIND_POINT_COMPUTE || unlikely(view.hasGfxStores())) {
+        accessImage(DxvkCmdBuffer::ExecBuffer, view,
+          util::pipelineStages(binding.getStageMask()), binding.getAccess(), accessOp);
+      }
+
+      DxvkAccess access = IsWritable && (binding.getAccess() & vk::AccessWriteMask)
+        ? DxvkAccess::Write : DxvkAccess::Read;
+      m_cmd->track(view.image(), access);
+    }
+
+    static uint32_t computePushDataBlockOffset(uint32_t index) {
+      return index ? MaxSharedPushDataSize + MaxPerStagePushDataSize * (index - 1u) : 0u;
+    }
+
+    static VkStencilOpState convertStencilOp(
+      const DxvkStencilOp&            op,
+            bool                      writable);
+
+    static bool formatsAreCopyCompatible(
+            VkFormat                  imageFormat,
+            VkFormat                  bufferFormat);
+
+    static bool formatsAreResolveCompatible(
+            VkFormat                  resolveFormat,
+            VkFormat                  viewFormat);
+
+    static VkFormat sanitizeTexelBufferFormat(
+            VkFormat                  srcFormat);
 
   };
   

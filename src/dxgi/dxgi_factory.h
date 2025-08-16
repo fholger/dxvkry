@@ -199,9 +199,11 @@ namespace dxvk {
     DxgiMonitorInfo  m_monitorInfo;
     UINT             m_flags;
     BOOL             m_monitorFallback;
+
+    D3DDestructionNotifier m_destructionNotifier;
       
 
-    HRESULT STDMETHODCALLTYPE CreateSwapChainForHwndBase(
+    HRESULT STDMETHODCALLTYPE CreateSwapChainBase(
             IUnknown*             pDevice,
             HWND                  hWnd,
       const DXGI_SWAP_CHAIN_DESC1* pDesc,

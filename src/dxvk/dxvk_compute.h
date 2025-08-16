@@ -7,14 +7,12 @@
 #include "dxvk_bind_mask.h"
 #include "dxvk_graphics_state.h"
 #include "dxvk_pipelayout.h"
-#include "dxvk_resource.h"
 #include "dxvk_shader.h"
 #include "dxvk_stats.h"
 
 namespace dxvk {
   
   class DxvkDevice;
-  class DxvkStateCache;
   class DxvkPipelineManager;
   struct DxvkPipelineStats;
 
@@ -66,7 +64,6 @@ namespace dxvk {
             DxvkDevice*                 device,
             DxvkPipelineManager*        pipeMgr,
             DxvkComputePipelineShaders  shaders,
-            DxvkBindingLayoutObjects*   layout,
             DxvkShaderPipelineLibrary*  library);
 
     ~DxvkComputePipeline();
@@ -80,15 +77,11 @@ namespace dxvk {
     }
     
     /**
-     * \brief Pipeline layout
-     * 
-     * Stores the pipeline layout and the descriptor set
-     * layouts, as well as information on the resource
-     * slots used by the pipeline.
+     * \brief Queries pipeline layout
      * \returns Pipeline layout
      */
-    DxvkBindingLayoutObjects* getBindings() const {
-      return m_bindings;
+    const DxvkPipelineBindings* getLayout() const {
+      return &m_layout;
     }
 
     /**
@@ -120,19 +113,30 @@ namespace dxvk {
      */
     void compilePipeline(
       const DxvkComputePipelineStateInfo& state);
-    
+
+    /**
+     * \brief Debug name
+     *
+     * Consists of the compute shader's debug name.
+     * \returns Debug name
+     */
+    const char* debugName() const {
+      return m_debugName.c_str();
+    }
+
   private:
     
     DxvkDevice*                 m_device;    
-    DxvkStateCache*             m_stateCache;
     DxvkPipelineStats*          m_stats;
 
     DxvkShaderPipelineLibrary*  m_library;
     VkPipeline                  m_libraryHandle;
 
     DxvkComputePipelineShaders  m_shaders;
-    DxvkBindingLayoutObjects*   m_bindings;
+    DxvkPipelineBindings        m_layout;
     
+    std::string                 m_debugName;
+
     alignas(CACHE_LINE_SIZE)
     dxvk::mutex                             m_mutex;
     sync::List<DxvkComputePipelineInstance> m_pipelines;
@@ -152,6 +156,8 @@ namespace dxvk {
     void logPipelineState(
             LogLevel                      level,
       const DxvkComputePipelineStateInfo& state) const;
+
+    std::string createDebugName() const;
 
   };
   

@@ -13,66 +13,44 @@ namespace dxvk {
   }
 
 
-  VkBuffer DxvkUnboundResources::bufferHandle() {
-    VkBuffer buffer = m_bufferHandle.load();
+  DxvkResourceBufferInfo DxvkUnboundResources::bufferInfo() {
+    if (unlikely(!m_bufferCreated.load(std::memory_order_acquire))) {
+      std::lock_guard lock(m_mutex);
 
-    if (likely(buffer != VK_NULL_HANDLE))
-      return buffer;
+      if (!m_bufferCreated.load(std::memory_order_acquire)) {
+        m_buffer = createBuffer();
+        m_bufferCreated.store(true, std::memory_order_release);
+      }
+    }
 
-    std::lock_guard lock(m_mutex);
-    buffer = m_bufferHandle.load();
-
-    if (buffer)
-      return buffer;
-
-    m_buffer = createBuffer();
-    buffer = m_buffer->getSliceHandle().handle;
-
-    m_bufferHandle.store(buffer, std::memory_order_release);
-    return buffer;
+    return m_buffer->getSliceInfo();;
   }
 
 
-  VkSampler DxvkUnboundResources::samplerHandle() {
-    VkSampler sampler = m_samplerHandle.load();
+  DxvkSamplerDescriptor DxvkUnboundResources::samplerInfo() {
+    if (unlikely(!m_samplerCreated.load(std::memory_order_acquire))) {
+      std::lock_guard lock(m_mutex);
 
-    if (likely(sampler != VK_NULL_HANDLE))
-      return sampler;
+      if (!m_samplerCreated.load(std::memory_order_acquire)) {
+        m_sampler = createSampler();
+        m_samplerCreated.store(true, std::memory_order_release);
+      }
+    }
 
-    std::lock_guard lock(m_mutex);
-    sampler = m_samplerHandle.load();
-
-    if (sampler)
-      return sampler;
-
-    m_sampler = createSampler();
-    sampler = m_sampler->handle();
-
-    m_samplerHandle.store(sampler, std::memory_order_release);
-    return sampler;
+    return m_sampler->getDescriptor();
   }
 
 
   Rc<DxvkSampler> DxvkUnboundResources::createSampler() {
-    DxvkSamplerCreateInfo info;
-    info.minFilter      = VK_FILTER_LINEAR;
-    info.magFilter      = VK_FILTER_LINEAR;
-    info.mipmapMode     = VK_SAMPLER_MIPMAP_MODE_LINEAR;
-    info.mipmapLodBias  = 0.0f;
-    info.mipmapLodMin   = -256.0f;
-    info.mipmapLodMax   =  256.0f;
-    info.useAnisotropy  = VK_FALSE;
-    info.maxAnisotropy  = 1.0f;
-    info.addressModeU   = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    info.addressModeV   = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    info.addressModeW   = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE;
-    info.compareToDepth = VK_FALSE;
-    info.compareOp      = VK_COMPARE_OP_NEVER;
-    info.reductionMode  = VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE;
-    info.borderColor    = VkClearColorValue();
-    info.usePixelCoord  = VK_FALSE;
-    info.nonSeamless    = VK_FALSE;
-    
+    DxvkSamplerKey info;
+    info.setFilter(VK_FILTER_LINEAR, VK_FILTER_LINEAR, VK_SAMPLER_MIPMAP_MODE_LINEAR);
+    info.setLodRange(-256.0f, 256.0f, 0.0f);
+    info.setAddressModes(
+      VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+      VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+      VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE);
+    info.setReduction(VK_SAMPLER_REDUCTION_MODE_WEIGHTED_AVERAGE);
+
     return m_device->createSampler(info);
   }
   
@@ -93,6 +71,7 @@ namespace dxvk {
     info.access     = VK_ACCESS_UNIFORM_READ_BIT
                     | VK_ACCESS_SHADER_READ_BIT
                     | VK_ACCESS_SHADER_WRITE_BIT;
+    info.debugName  = "Null buffer";
     
     Rc<DxvkBuffer> buffer = m_device->createBuffer(info,
       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |

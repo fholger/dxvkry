@@ -19,7 +19,10 @@ namespace dxvk {
 
   public:
 
-    D3D9InterfaceEx(bool bExtended);
+    D3D9InterfaceEx(
+              bool           bExtended,
+        const D3D9ON12_ARGS* pOverrideList,
+              uint32_t       OverrideCount);
 
     ~D3D9InterfaceEx();
 
@@ -121,6 +124,8 @@ namespace dxvk {
 
     HRESULT STDMETHODCALLTYPE GetAdapterLUID(UINT Adapter, LUID* pLUID);
 
+    HRESULT ValidatePresentationParameters(D3DPRESENT_PARAMETERS* pPresentationParameters);
+
     const D3D9Options& GetOptions() { return m_d3d9Options; }
 
     D3D9Adapter* GetAdapter(UINT Ordinal) {
@@ -131,13 +136,18 @@ namespace dxvk {
 
     bool IsExtended() { return m_extended; }
 
+    bool IsD3D8Compatible() const {
+      return m_isD3D8Compatible;
+    }
+
+    void EnableD3D8CompatibilityMode() {
+      m_isD3D8Compatible = true;
+      Logger::info("The D3D9 interface is now operating in D3D8 compatibility mode.");
+    }
+
     Rc<DxvkInstance> GetInstance() { return m_instance; }
 
   private:
-
-    void CacheModes(D3D9Format Format);
-
-    static const char* GetDriverDllName(DxvkGpuVendor vendor);
 
     Rc<DxvkInstance>              m_instance;
 
@@ -145,11 +155,18 @@ namespace dxvk {
 
     bool                          m_extended;
 
+    bool                          m_isD3D8Compatible = false;
+
     D3D9Options                   m_d3d9Options;
 
     std::vector<D3D9Adapter>      m_adapters;
 
     D3D9VkInteropInterface        m_d3d9Interop;
+
+    static const D3D9ON12_ARGS* Find9On12Args(
+      const Rc<DxvkAdapter>& Adapter,
+      const D3D9ON12_ARGS*   pOverrides,
+            uint32_t         OverrideCount);
 
   };
 

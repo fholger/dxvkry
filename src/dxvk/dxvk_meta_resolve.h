@@ -7,7 +7,7 @@
 
 #include "dxvk_barrier.h"
 #include "dxvk_cmdlist.h"
-#include "dxvk_resource.h"
+#include "dxvk_image.h"
 
 namespace dxvk {
 
@@ -18,9 +18,8 @@ namespace dxvk {
    * that is used for fragment shader resolve.
    */
   struct DxvkMetaResolvePipeline {
-    VkDescriptorSetLayout dsetLayout;
-    VkPipelineLayout      pipeLayout;
-    VkPipeline            pipeHandle;
+    const DxvkPipelineLayout* layout   = nullptr;
+    VkPipeline                pipeline = VK_NULL_HANDLE;
   };
 
   /**
@@ -30,10 +29,10 @@ namespace dxvk {
    * on the copy operation they support.
    */
   struct DxvkMetaResolvePipelineKey {
-    VkFormat                  format;
-    VkSampleCountFlagBits     samples;
-    VkResolveModeFlagBits     modeD;
-    VkResolveModeFlagBits     modeS;
+    VkFormat                  format  = VK_FORMAT_UNDEFINED;
+    VkSampleCountFlagBits     samples = VK_SAMPLE_COUNT_1_BIT;
+    VkResolveModeFlagBits     modeD   = VK_RESOLVE_MODE_NONE;
+    VkResolveModeFlagBits     modeS   = VK_RESOLVE_MODE_NONE;
 
     bool eq(const DxvkMetaResolvePipelineKey& other) const {
       return this->format  == other.format
@@ -53,12 +52,11 @@ namespace dxvk {
   /**
    * \brief Meta resolve views for attachment-based resolves
    */
-  class DxvkMetaResolveViews : public DxvkResource {
+  class DxvkMetaResolveViews {
 
   public:
 
     DxvkMetaResolveViews(
-      const Rc<vk::DeviceFn>&         vkd,
       const Rc<DxvkImage>&            dstImage,
       const VkImageSubresourceLayers& dstSubresources,
       const Rc<DxvkImage>&            srcImage,
@@ -67,15 +65,8 @@ namespace dxvk {
 
     ~DxvkMetaResolveViews();
 
-    VkImageView getDstView() const { return m_dstImageView; }
-    VkImageView getSrcView() const { return m_srcImageView; }
-
-  private:
-
-    Rc<vk::DeviceFn> m_vkd;
-
-    VkImageView m_dstImageView = VK_NULL_HANDLE;
-    VkImageView m_srcImageView = VK_NULL_HANDLE;
+    Rc<DxvkImageView> dstView;
+    Rc<DxvkImageView> srcView;
 
   };
 
@@ -90,7 +81,7 @@ namespace dxvk {
 
   public:
 
-    DxvkMetaResolveObjects(const DxvkDevice* device);
+    DxvkMetaResolveObjects(DxvkDevice* device);
     ~DxvkMetaResolveObjects();
 
     /**
@@ -110,15 +101,7 @@ namespace dxvk {
 
   private:
 
-    Rc<vk::DeviceFn> m_vkd;
-
-    VkShaderModule m_shaderVert  = VK_NULL_HANDLE;
-    VkShaderModule m_shaderGeom  = VK_NULL_HANDLE;
-    VkShaderModule m_shaderFragF = VK_NULL_HANDLE;
-    VkShaderModule m_shaderFragU = VK_NULL_HANDLE;
-    VkShaderModule m_shaderFragI = VK_NULL_HANDLE;
-    VkShaderModule m_shaderFragD = VK_NULL_HANDLE;
-    VkShaderModule m_shaderFragDS = VK_NULL_HANDLE;
+    DxvkDevice* m_device = nullptr;
 
     dxvk::mutex m_mutex;
 
@@ -126,23 +109,10 @@ namespace dxvk {
       DxvkMetaResolvePipelineKey,
       DxvkMetaResolvePipeline,
       DxvkHash, DxvkEq> m_pipelines;
-    
-    VkShaderModule createShaderModule(
-      const SpirvCodeBuffer&          code) const;
-    
+
     DxvkMetaResolvePipeline createPipeline(
       const DxvkMetaResolvePipelineKey& key);
 
-    VkDescriptorSetLayout createDescriptorSetLayout(
-      const DxvkMetaResolvePipelineKey& key);
-    
-    VkPipelineLayout createPipelineLayout(
-            VkDescriptorSetLayout  descriptorSetLayout);
-    
-    VkPipeline createPipelineObject(
-      const DxvkMetaResolvePipelineKey& key,
-            VkPipelineLayout       pipelineLayout);
-    
   };
 
 }

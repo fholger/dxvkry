@@ -33,6 +33,7 @@ namespace dxvk {
     ExportsSampleMask,
     UsesFragmentCoverage,
     UsesSparseResidency,
+    TessellationPoints,
   };
 
   using DxvkShaderFlags = Flags<DxvkShaderFlag>;
@@ -51,18 +52,19 @@ namespace dxvk {
     uint32_t outputMask = 0;
     /// Flat shading input mask
     uint32_t flatShadingInputs = 0;
-    /// Push constant range
-    VkShaderStageFlags pushConstStages = 0;
-    uint32_t pushConstSize = 0;
-    /// Uniform buffer data
-    uint32_t uniformSize = 0;
-    const char* uniformData = nullptr;
+    /// Push data blocks
+    DxvkPushDataBlock sharedPushData;
+    DxvkPushDataBlock localPushData;
+    /// Descriptor set and binding of global sampler heap
+    DxvkShaderBinding samplerHeap;
     /// Rasterized stream, or -1
     int32_t xfbRasterizedStream = 0;
     /// Tess control patch vertex count
     uint32_t patchVertexCount = 0;
     /// Transform feedback vertex strides
     uint32_t xfbStrides[MaxNumXfbBuffers] = { };
+    /// Input primitive topology for geometry shaders
+    VkPrimitiveTopology inputTopology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
     /// Output primitive topology
     VkPrimitiveTopology outputTopology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
   };
@@ -75,6 +77,7 @@ namespace dxvk {
     bool      fsDualSrcBlend  = false;
     bool      fsFlatShading   = false;
     uint32_t  undefinedInputs = 0;
+    VkPrimitiveTopology inputTopology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
 
     std::array<VkComponentMapping, MaxNumRenderTargets> rtSwizzles = { };
 
@@ -119,11 +122,11 @@ namespace dxvk {
     }
 
     /**
-     * \brief Retrieves binding layout
-     * \returns Binding layout
+     * \brief Queries shader binding layout
+     * \returns Pipeline layout builder
      */
-    const DxvkBindingLayout& getBindings() const {
-      return m_bindings;
+    DxvkPipelineLayoutBuilder getLayout() const {
+      return m_layout;
     }
 
     /**
@@ -168,12 +171,12 @@ namespace dxvk {
      *
      * Rewrites binding IDs and potentially fixes up other
      * parts of the code depending on pipeline state.
-     * \param [in] layout Biding layout
+     * \param [in] bindings Biding map
      * \param [in] state Pipeline state info
      * \returns Uncompressed SPIR-V code buffer
      */
     SpirvCodeBuffer getCode(
-      const DxvkBindingLayoutObjects*   layout,
+      const DxvkShaderBindingMap*       bindings,
       const DxvkShaderModuleCreateInfo& state) const;
     
     /**
@@ -248,9 +251,15 @@ namespace dxvk {
   private:
 
     struct BindingOffsets {
-      uint32_t bindingId;
-      uint32_t bindingOffset;
-      uint32_t setOffset;
+      uint32_t bindingIndex = 0u;
+      uint32_t bindingOffset = 0u;
+      uint32_t setIndex = 0u;
+      uint32_t setOffset = 0u;
+    };
+
+    struct PushDataOffsets {
+      uint32_t codeOffset = 0u;
+      uint32_t pushOffset = 0u;
     };
 
     DxvkShaderCreateInfo          m_info;
@@ -266,10 +275,10 @@ namespace dxvk {
     uint32_t                      m_specConstantMask = 0;
     std::atomic<bool>             m_needsLibraryCompile = { true };
 
-    std::vector<char>             m_uniformData;
     std::vector<BindingOffsets>   m_bindingOffsets;
+    std::vector<PushDataOffsets>  m_pushDataOffsets;
 
-    DxvkBindingLayout             m_bindings;
+    DxvkPipelineLayoutBuilder     m_layout;
 
     static void eliminateInput(
             SpirvCodeBuffer&          code,
@@ -283,6 +292,10 @@ namespace dxvk {
     static void emitFlatShadingDeclarations(
             SpirvCodeBuffer&          code,
             uint32_t                  inputMask);
+
+    static void patchInputTopology(
+            SpirvCodeBuffer&          code,
+            VkPrimitiveTopology       topology);
 
   };
   
@@ -418,10 +431,10 @@ namespace dxvk {
     DxvkShaderSet getShaderSet() const;
 
     /**
-     * \brief Generates merged binding layout
-     * \returns Binding layout
+     * \brief Builds merged binding layout
+     * \returns Pipeline layout builder
      */
-    DxvkBindingLayout getBindings() const;
+    DxvkPipelineLayoutBuilder getLayout() const;
 
     /**
      * \brief Adds a shader to the key
@@ -468,8 +481,8 @@ namespace dxvk {
    * Stores a pipeline library handle and the necessary link flags.
    */
   struct DxvkShaderPipelineLibraryHandle {
-    VkPipeline            handle;
-    VkPipelineCreateFlags linkFlags;
+    VkPipeline              handle;
+    VkPipelineCreateFlags2  linkFlags;
   };
 
 
@@ -487,10 +500,9 @@ namespace dxvk {
   public:
 
     DxvkShaderPipelineLibrary(
-      const DxvkDevice*               device,
+            DxvkDevice*               device,
             DxvkPipelineManager*      manager,
-      const DxvkShaderPipelineLibraryKey& key,
-      const DxvkBindingLayoutObjects* layout);
+      const DxvkShaderPipelineLibraryKey& key);
 
     ~DxvkShaderPipelineLibrary();
 
@@ -537,9 +549,11 @@ namespace dxvk {
   private:
 
     const DxvkDevice*               m_device;
-          DxvkPipelineStats*        m_stats;
-          DxvkShaderSet             m_shaders;
-    const DxvkBindingLayoutObjects* m_layout;
+
+    DxvkPipelineStats*              m_stats;
+    DxvkShaderSet                   m_shaders;
+
+    DxvkPipelineBindings            m_layout;
 
     dxvk::mutex                     m_mutex;
     DxvkShaderPipelineLibraryHandle m_pipeline      = { VK_NULL_HANDLE, 0 };
@@ -554,19 +568,19 @@ namespace dxvk {
     DxvkShaderPipelineLibraryHandle compileShaderPipelineLocked();
 
     DxvkShaderPipelineLibraryHandle compileShaderPipeline(
-            VkPipelineCreateFlags                 flags);
+            VkPipelineCreateFlags2        flags);
 
     VkPipeline compileVertexShaderPipeline(
       const DxvkShaderStageInfo&          stageInfo,
-            VkPipelineCreateFlags         flags);
+            VkPipelineCreateFlags2        flags);
 
     VkPipeline compileFragmentShaderPipeline(
       const DxvkShaderStageInfo&          stageInfo,
-            VkPipelineCreateFlags         flags);
+            VkPipelineCreateFlags2        flags);
 
     VkPipeline compileComputeShaderPipeline(
       const DxvkShaderStageInfo&          stageInfo,
-            VkPipelineCreateFlags         flags);
+            VkPipelineCreateFlags2        flags);
 
     SpirvCodeBuffer getShaderCode(
             VkShaderStageFlagBits         stage) const;

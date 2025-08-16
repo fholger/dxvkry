@@ -13,9 +13,12 @@ namespace dxvk {
 
     D3D9FormatHelper(const Rc<DxvkDevice>& device);
 
+    ~D3D9FormatHelper();
+
     void Flush();
 
     void ConvertFormat(
+      const Rc<DxvkCommandList>&          ctx,
             D3D9_CONVERSION_FORMAT_INFO   conversionFormat,
       const Rc<DxvkImage>&                dstImage,
             VkImageSubresourceLayers      dstSubresource,
@@ -24,12 +27,12 @@ namespace dxvk {
   private:
 
     void ConvertGenericFormat(
+      const Rc<DxvkCommandList>&          ctx,
             D3D9_CONVERSION_FORMAT_INFO   videoFormat,
       const Rc<DxvkImage>&                dstImage,
             VkImageSubresourceLayers      dstSubresource,
       const DxvkBufferSlice&              srcSlice,
             VkFormat                      bufferFormat,
-            uint32_t                      specConstantValue,
             VkExtent2D                    macroPixelRun);
 
     enum BindingIds : uint32_t {
@@ -37,18 +40,17 @@ namespace dxvk {
       Buffer = 1,
     };
 
-    void InitShaders();
+    void InitPipelines();
 
-    Rc<DxvkShader> InitShader(SpirvCodeBuffer code);
+    const DxvkPipelineLayout* CreatePipelineLayout();
 
-    void FlushInternal();
+    VkPipeline CreatePipeline(size_t size, const uint32_t* code, uint32_t specConstant);
 
-    Rc<DxvkDevice>    m_device;
-    Rc<DxvkContext>   m_context;
+    Rc<DxvkDevice>            m_device;
 
-    size_t            m_transferCommands = 0;
+    const DxvkPipelineLayout* m_layout = nullptr;
 
-    std::array<Rc<DxvkShader>, D3D9ConversionFormat_Count> m_shaders;
+    std::array<VkPipeline, D3D9ConversionFormat_Count> m_pipelines = { };
 
   };
   

@@ -22,7 +22,8 @@ namespace dxvk {
     m_presentId (0u),
     m_presenter (pPresenter),
     m_monitor   (wsi::getWindowMonitor(m_window)),
-    m_is_d3d12(SUCCEEDED(pDevice->QueryInterface(__uuidof(ID3D12CommandQueue), reinterpret_cast<void**>(&Com<ID3D12CommandQueue>())))) {
+    m_is_d3d12(SUCCEEDED(pDevice->QueryInterface(__uuidof(ID3D12CommandQueue), reinterpret_cast<void**>(&Com<ID3D12CommandQueue>())))),
+    m_destructionNotifier(this) {
 
     if (FAILED(m_presenter->GetAdapter(__uuidof(IDXGIAdapter), reinterpret_cast<void**>(&m_adapter))))
       throw DxvkError("DXGI: Failed to get adapter for present device");
@@ -43,6 +44,14 @@ namespace dxvk {
 
     // Ensure that RGBA16 swap chains are scRGB if supported
     UpdateColorSpace(m_desc.Format, m_colorSpace);
+
+    // Somewhat hacky way to determine whether to forward the
+    // display refresh rate in windowed mode even with a sync
+    // interval of 1.
+    if (!m_is_d3d12) {
+      auto instance = pFactory->GetDXVKInstance();
+      m_hasLatencyControl = instance->options().latencySleep == Tristate::True;
+    }
   }
   
   
@@ -77,6 +86,11 @@ namespace dxvk {
      || riid == __uuidof(IDXGISwapChain3)
      || riid == __uuidof(IDXGISwapChain4)) {
       *ppvObject = ref(this);
+      return S_OK;
+    }
+
+    if (riid == __uuidof(ID3DDestructionNotifier)) {
+      *ppvObject = ref(&m_destructionNotifier);
       return S_OK;
     }
     
@@ -347,7 +361,7 @@ namespace dxvk {
     std::lock_guard<dxvk::recursive_mutex> lockWin(m_lockWindow);
     HRESULT hr = S_OK;
 
-    if (wsi::isWindow(m_window)) {
+    if (wsi::isWindow(m_window) || !m_window) {
       std::lock_guard<dxvk::mutex> lockBuf(m_lockBuffer);
       hr = m_presenter->Present(SyncInterval, PresentFlags, nullptr);
     }
@@ -406,7 +420,7 @@ namespace dxvk {
           UINT                      SwapChainFlags,
     const UINT*                     pCreationNodeMask,
           IUnknown* const*          ppPresentQueue) {
-    if (!wsi::isWindow(m_window))
+    if (m_window && !wsi::isWindow(m_window))
       return DXGI_ERROR_INVALID_CALL;
 
     constexpr UINT PreserveFlags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
@@ -418,9 +432,11 @@ namespace dxvk {
     m_desc.Width  = Width;
     m_desc.Height = Height;
     
-    wsi::getWindowSize(m_window,
-      m_desc.Width  ? nullptr : &m_desc.Width,
-      m_desc.Height ? nullptr : &m_desc.Height);
+    if (m_window) {
+      wsi::getWindowSize(m_window,
+        m_desc.Width  ? nullptr : &m_desc.Width,
+        m_desc.Height ? nullptr : &m_desc.Height);
+    }
     
     if (BufferCount != 0)
       m_desc.BufferCount = BufferCount;
@@ -813,7 +829,7 @@ namespace dxvk {
     if (!selectedMode.RefreshRate.Denominator)
       selectedMode.RefreshRate.Denominator = 1;
 
-    if (!wsi::setWindowMode(outputDesc.Monitor, m_window, ConvertDisplayMode(selectedMode)))
+    if (!wsi::setWindowMode(outputDesc.Monitor, m_window, &m_windowState, ConvertDisplayMode(selectedMode)))
       return DXGI_ERROR_NOT_CURRENTLY_AVAILABLE;
 
     DXGI_VK_MONITOR_DATA* monitorData = nullptr;
@@ -996,6 +1012,29 @@ namespace dxvk {
           UINT                    SyncInterval) {
     if (m_presenter2 == nullptr)
       return;
+
+    // Engage the frame limiter with large sync intervals even in windowed
+    // mode since we want to avoid double-presenting to the swap chain.
+    if (SyncInterval != m_frameRateSyncInterval && m_descFs.Windowed) {
+      bool engageLimiter = (SyncInterval > 1u) || (SyncInterval && m_hasLatencyControl);
+
+      m_frameRateSyncInterval = SyncInterval;
+      m_frameRateRefresh = 0.0f;
+
+      if (engageLimiter && wsi::isWindow(m_window)) {
+        wsi::WsiMode mode = { };
+
+        if (wsi::getCurrentDisplayMode(wsi::getWindowMonitor(m_window), &mode)) {
+          if (mode.refreshRate.numerator && mode.refreshRate.denominator) {
+            m_frameRateRefresh = double(mode.refreshRate.numerator)
+                               / double(mode.refreshRate.denominator);
+          }
+        }
+      }
+    } else if (!m_descFs.Windowed) {
+      // Reset tracking when in fullscreen mode
+      m_frameRateSyncInterval = 0;
+    }
 
     // Use a negative number to indicate that the limiter should only
     // be engaged if the target frame rate is actually exceeded

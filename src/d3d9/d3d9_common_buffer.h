@@ -133,17 +133,13 @@ namespace dxvk {
       return DxvkBufferSlice();
     }
 
-    inline DxvkBufferSliceHandle AllocMapSlice() {
-      return GetMapBuffer()->allocSlice();
+    inline Rc<DxvkResourceAllocation> DiscardMapSlice() {
+      m_allocation = GetMapBuffer()->allocateStorage();
+      return m_allocation;
     }
 
-    inline DxvkBufferSliceHandle DiscardMapSlice() {
-      m_sliceHandle = GetMapBuffer()->allocSlice();
-      return m_sliceHandle;
-    }
-
-    inline DxvkBufferSliceHandle GetMappedSlice() const {
-      return m_sliceHandle;
+    inline Rc<DxvkResourceAllocation> GetMappedSlice() const {
+      return m_allocation;
     }
 
     inline DWORD GetMapFlags() const      { return m_mapFlags; }
@@ -240,7 +236,7 @@ namespace dxvk {
     Rc<DxvkBuffer>              m_buffer;
     Rc<DxvkBuffer>              m_stagingBuffer;
 
-    DxvkBufferSliceHandle       m_sliceHandle;
+    Rc<DxvkResourceAllocation>  m_allocation;
 
     D3D9Range                   m_dirtyRange;
 

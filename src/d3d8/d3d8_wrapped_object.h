@@ -38,8 +38,8 @@ namespace dxvk {
         return this;
       if (riid == __uuidof(D3D8))
         return this;
-      
-      throw E_NOINTERFACE;
+
+      throw DxvkError("D3D8WrappedObject::QueryInterface: Unknown interface query");
     }
 
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) final {
@@ -51,13 +51,12 @@ namespace dxvk {
       try {
         *ppvObject = ref(this->GetInterface(riid));
         return S_OK;
-      } catch (HRESULT err) {
-        Logger::warn("D3D8WrappedObject::QueryInterface: Unknown interface query");
+      } catch (const DxvkError& e) {
+        Logger::warn(e.message());
         Logger::warn(str::format(riid));
-        return err;
+        return E_NOINTERFACE;
       }
     }
-
 
   private:
 

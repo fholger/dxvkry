@@ -9,7 +9,7 @@ namespace dxvk {
           D3D11Device*  pDevice,
           UINT          ContextFlags)
   : D3D11DeviceChild<ID3D11CommandList>(pDevice),
-    m_contextFlags(ContextFlags) { }
+    m_contextFlags(ContextFlags), m_destructionNotifier(this) { }
   
   
   D3D11CommandList::~D3D11CommandList() {
@@ -29,7 +29,12 @@ namespace dxvk {
       *ppvObject = ref(this);
       return S_OK;
     }
-    
+
+    if (riid == __uuidof(ID3DDestructionNotifier)) {
+      *ppvObject = ref(&m_destructionNotifier);
+      return S_OK;
+    }
+
     if (logQueryInterfaceError(__uuidof(ID3D11CommandList), riid)) {
       Logger::warn("D3D11CommandList::QueryInterface: Unknown interface query");
       Logger::warn(str::format(riid));
@@ -74,8 +79,6 @@ namespace dxvk {
       m_resources.push_back(std::move(entry));
     }
 
-    pCommandList->MarkSubmitted();
-
     // Return ID of the last chunk added. The command list
     // added can never be empty, so do not handle zero.
     return m_chunks.size() - 1;
@@ -102,8 +105,6 @@ namespace dxvk {
       while (j < m_resources.size() && m_resources[j].chunkId == i)
         TrackResourceSequenceNumber(m_resources[j++].ref, seq);
     }
-
-    MarkSubmitted();
   }
   
   
@@ -148,16 +149,6 @@ namespace dxvk {
         auto impl = static_cast<D3D11Texture3D*>(iface)->GetCommonTexture();
         impl->TrackSequenceNumber(Resource.GetSubresource(), Seq);
       } break;
-    }
-  }
-
-
-  void D3D11CommandList::MarkSubmitted() {
-    if (m_submitted.exchange(true) && !m_warned.exchange(true)
-     && m_parent->GetOptions()->dcSingleUseMode) {
-      Logger::warn(
-        "D3D11: Command list submitted multiple times,\n"
-        "       but d3d11.dcSingleUseMode is enabled");
     }
   }
   

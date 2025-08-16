@@ -141,8 +141,6 @@ namespace dxvk {
             D3D9TextureStageStateTypes Type,
             DWORD                      Value);
 
-    HRESULT MultiplyStateTransform(uint32_t idx, const D3DMATRIX* pMatrix);
-
     HRESULT SetViewport(const D3DVIEWPORT9* pViewport);
 
     HRESULT SetScissorRect(const RECT* pRect);
@@ -279,7 +277,7 @@ namespace dxvk {
           for (uint32_t consts : bit::BitMask(m_captures.vsConsts.fConsts.dword(i))) {
             uint32_t idx = i * 32 + consts;
 
-            dst->SetVertexShaderConstantF(idx, (float*)&src->vsConsts->fConsts[idx], 1);
+            dst->SetVertexShaderConstantF(idx, reinterpret_cast<const float*>(&src->vsConsts->fConsts[idx]), 1);
           }
         }
 
@@ -287,7 +285,7 @@ namespace dxvk {
           for (uint32_t consts : bit::BitMask(m_captures.vsConsts.iConsts.dword(i))) {
             uint32_t idx = i * 32 + consts;
 
-            dst->SetVertexShaderConstantI(idx, (int*)&src->vsConsts->iConsts[idx], 1);
+            dst->SetVertexShaderConstantI(idx, reinterpret_cast<const int*>(&src->vsConsts->iConsts[idx]), 1);
           }
         }
 
@@ -302,7 +300,7 @@ namespace dxvk {
           for (uint32_t consts : bit::BitMask(m_captures.psConsts.fConsts.dword(i))) {
             uint32_t idx = i * 32 + consts;
 
-            dst->SetPixelShaderConstantF(idx, (float*)&src->psConsts->fConsts[idx], 1);
+            dst->SetPixelShaderConstantF(idx, reinterpret_cast<const float*>(&src->psConsts->fConsts[idx]), 1);
           }
         }
 
@@ -310,7 +308,7 @@ namespace dxvk {
           for (uint32_t consts : bit::BitMask(m_captures.psConsts.iConsts.dword(i))) {
             uint32_t idx = i * 32 + consts;
 
-            dst->SetPixelShaderConstantI(idx, (int*)&src->psConsts->iConsts[idx], 1);
+            dst->SetPixelShaderConstantI(idx, reinterpret_cast<const int*>(&src->psConsts->iConsts[idx]), 1);
           }
         }
 
@@ -390,10 +388,6 @@ namespace dxvk {
     HRESULT SetVertexBoolBitfield(uint32_t idx, uint32_t mask, uint32_t bits);
     HRESULT SetPixelBoolBitfield (uint32_t idx, uint32_t mask, uint32_t bits);
 
-    inline bool IsApplying() {
-      return m_applying;
-    }
-
   private:
 
     void CapturePixelRenderStates();
@@ -409,9 +403,7 @@ namespace dxvk {
     D3D9CapturableState  m_state;
     D3D9StateCaptures    m_captures;
 
-    D3D9DeviceState* m_deviceState;
-
-    bool                 m_applying = false;
+    D3D9DeviceState*     m_deviceState;
 
   };
 

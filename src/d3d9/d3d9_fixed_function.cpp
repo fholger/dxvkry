@@ -6,6 +6,8 @@
 
 #include "../dxvk/dxvk_hash.h"
 
+#include "../util/util_small_vector.h"
+
 #include "../spirv/spirv_module.h"
 
 #include <cfloat>
@@ -302,7 +304,7 @@ namespace dxvk {
           case VK_COMPARE_OP_EQUAL:            return spvModule.opFOrdEqual           (boolType, alphaId, alphaRefId);
           case VK_COMPARE_OP_LESS_OR_EQUAL:    return spvModule.opFOrdLessThanEqual   (boolType, alphaId, alphaRefId);
           case VK_COMPARE_OP_GREATER:          return spvModule.opFOrdGreaterThan     (boolType, alphaId, alphaRefId);
-          case VK_COMPARE_OP_NOT_EQUAL:        return spvModule.opFOrdNotEqual        (boolType, alphaId, alphaRefId);
+          case VK_COMPARE_OP_NOT_EQUAL:        return spvModule.opFUnordNotEqual      (boolType, alphaId, alphaRefId);
           case VK_COMPARE_OP_GREATER_OR_EQUAL: return spvModule.opFOrdGreaterThanEqual(boolType, alphaId, alphaRefId);
           default:
           case VK_COMPARE_OP_ALWAYS:           return spvModule.constBool(true);
@@ -337,26 +339,34 @@ namespace dxvk {
   }
 
 
-  uint32_t SetupRenderStateBlock(SpirvModule& spvModule) {
+  std::pair<uint32_t, uint32_t> SetupRenderStateBlock(SpirvModule& spvModule, uint32_t samplerMask) {
     uint32_t floatType = spvModule.defFloatType(32);
     uint32_t uintType  = spvModule.defIntType(32, 0);
     uint32_t vec3Type  = spvModule.defVectorType(floatType, 3);
 
-    std::array<uint32_t, 11> rsMembers = {{
-      vec3Type,
-      floatType,
-      floatType,
-      floatType,
+    small_vector<uint32_t, 32u> rsMembers;
+    rsMembers.push_back(vec3Type);
+    rsMembers.push_back(floatType);
+    rsMembers.push_back(floatType);
+    rsMembers.push_back(floatType);
 
-      uintType,
+    rsMembers.push_back(uintType);
 
-      floatType,
-      floatType,
-      floatType,
-      floatType,
-      floatType,
-      floatType,
-    }};
+    rsMembers.push_back(floatType);
+    rsMembers.push_back(floatType);
+    rsMembers.push_back(floatType);
+    rsMembers.push_back(floatType);
+    rsMembers.push_back(floatType);
+    rsMembers.push_back(floatType);
+
+    // Number of static data members
+    uint32_t rsMemberCount = rsMembers.size();
+
+    // Add one dword for each sampler pair
+    uint32_t samplerCount = bit::popcnt(samplerMask);
+
+    for (uint32_t i = 0u; i < samplerCount; i += 2u)
+      rsMembers.push_back(uintType);
 
     uint32_t rsStruct = spvModule.defStructTypeUnique(rsMembers.size(), rsMembers.data());
     uint32_t rsBlock = spvModule.newVar(
@@ -387,7 +397,59 @@ namespace dxvk {
     SetMemberName("point_scale_b",  offsetof(D3D9RenderStateInfo, pointScaleB));
     SetMemberName("point_scale_c",  offsetof(D3D9RenderStateInfo, pointScaleC));
 
-    return rsBlock;
+    uint32_t samplerOffset = GetPushSamplerOffset(0u);
+
+    while (samplerMask) {
+      uint32_t s0 = bit::tzcnt(samplerMask); samplerMask &= samplerMask - 1u;
+      uint32_t s1 = bit::tzcnt(samplerMask); samplerMask &= samplerMask - 1u;
+
+      std::string name = s1 < samplerCount
+        ? str::format("s", s0, "_s", s1, "_idx")
+        : str::format("s", s0, "_idx");
+
+      SetMemberName(name.c_str(), samplerOffset);
+      samplerOffset += sizeof(uint32_t);
+    }
+
+    return std::make_pair(rsBlock, rsMemberCount);
+  }
+
+
+  uint32_t SetupSamplerArray(SpirvModule& spvModule) {
+    // Old spir-v, need to enable extension
+    spvModule.enableExtension("SPV_EXT_descriptor_indexing");
+    spvModule.enableCapability(spv::CapabilityRuntimeDescriptorArray);
+
+    uint32_t samplerArray = spvModule.defRuntimeArrayTypeUnique(spvModule.defSamplerType());
+    uint32_t samplerPtr = spvModule.defPointerType(samplerArray, spv::StorageClassUniformConstant);
+
+    uint32_t samplerHeap = spvModule.newVar(samplerPtr, spv::StorageClassUniformConstant);
+    spvModule.setDebugName(samplerHeap, "sampler_heap");
+
+    spvModule.decorateBinding(samplerHeap, 0u);
+    spvModule.decorateDescriptorSet(samplerHeap, GetGlobalSamplerSetIndex());
+    return samplerHeap;
+  }
+
+
+  uint32_t LoadSampler(SpirvModule& spvModule, uint32_t descriptorId,
+    uint32_t pushBlockId, uint32_t pushMember, uint32_t samplerIndex) {
+    uint32_t uintType = spvModule.defIntType(32u, 0);
+    uint32_t uintPtr = spvModule.defPointerType(uintType, spv::StorageClassPushConstant);
+
+    uint32_t pushIndexId = spvModule.constu32(pushMember + samplerIndex / 2u);
+
+    uint32_t descriptorIndex = spvModule.opLoad(uintType,
+      spvModule.opAccessChain(uintPtr, pushBlockId, 1u, &pushIndexId));
+
+    descriptorIndex = spvModule.opBitFieldUExtract(uintType, descriptorIndex,
+      spvModule.constu32(16u * (samplerIndex & 1u)), spvModule.constu32(16u));
+
+    uint32_t samplerType = spvModule.defSamplerType();
+    uint32_t samplerPtr = spvModule.defPointerType(samplerType, spv::StorageClassUniformConstant);
+
+    return spvModule.opLoad(samplerType,
+      spvModule.opAccessChain(samplerPtr, descriptorId, 1u, &descriptorIndex));
   }
 
 
@@ -417,12 +479,13 @@ namespace dxvk {
     spvModule.decorateDescriptorSet(specBlock, 0);
     spvModule.decorateBinding      (specBlock, getSpecConstantBufferSlot());
 
-    DxvkBindingInfo binding = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER };
-    binding.resourceBinding = getSpecConstantBufferSlot();
-    binding.viewType        = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+    auto& binding = bindings.emplace_back();
+    binding.set             = 0u;
+    binding.binding         = getSpecConstantBufferSlot();
+    binding.resourceIndex   = getSpecConstantBufferSlot();
+    binding.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     binding.access          = VK_ACCESS_UNIFORM_READ_BIT;
-    binding.uboSet          = VK_TRUE;
-    bindings.push_back(binding);
+    binding.flags.set(DxvkDescriptorFlag::UniformBuffer);
 
     return specBlock;
   }
@@ -707,8 +770,10 @@ namespace dxvk {
 
     struct {
       uint32_t texcoordCnt;
-      uint32_t typeId;
-      uint32_t varId;
+      uint32_t imageTypeId;
+      uint32_t imageVarId;
+      uint32_t sampledTypeId;
+      uint32_t samplerIndex;
     } samplers[8];
 
     struct {
@@ -744,7 +809,7 @@ namespace dxvk {
 
     void compileVS();
 
-    void setupRenderStateInfo();
+    void setupRenderStateInfo(VkShaderStageFlagBits stage, uint32_t samplerCount);
 
     void emitLightTypeDecl();
 
@@ -776,8 +841,8 @@ namespace dxvk {
     std::vector
       <DxvkBindingInfo>   m_bindings;
 
-    uint32_t              m_inputMask = 0u;
-    uint32_t              m_outputMask = 0u;
+    uint32_t              m_inputMask       = 0u;
+    uint32_t              m_outputMask      = 0u;
     uint32_t              m_flatShadingMask = 0u;
 
     DxsoProgramType       m_programType;
@@ -790,19 +855,24 @@ namespace dxvk {
     DxsoIsgn              m_isgn;
     DxsoIsgn              m_osgn;
 
-    uint32_t              m_floatType;
-    uint32_t              m_uint32Type;
-    uint32_t              m_vec4Type;
-    uint32_t              m_vec3Type;
-    uint32_t              m_vec2Type;
-    uint32_t              m_mat3Type;
-    uint32_t              m_mat4Type;
+    uint32_t              m_floatType       = 0u;
+    uint32_t              m_uint32Type      = 0u;
+    uint32_t              m_vec4Type        = 0u;
+    uint32_t              m_vec3Type        = 0u;
+    uint32_t              m_vec2Type        = 0u;
+    uint32_t              m_mat3Type        = 0u;
+    uint32_t              m_mat4Type        = 0u;
 
-    uint32_t              m_entryPointId;
+    uint32_t              m_entryPointId    = 0u;
 
-    uint32_t              m_rsBlock;
-    uint32_t              m_specUbo;
-    uint32_t              m_mainFuncLabel;
+    uint32_t              m_samplerArray    = 0u;
+
+    uint32_t              m_rsBlock         = 0u;
+    uint32_t              m_rsFirstSampler  = 0u;
+    uint32_t              m_specUbo         = 0u;
+    uint32_t              m_mainFuncLabel   = 0u;
+
+    DxvkPushDataBlock     m_samplerBlock;
 
     D3D9FixedFunctionOptions m_options;
 
@@ -814,11 +884,11 @@ namespace dxvk {
     const D3D9FFShaderKeyVS&       Key,
     const std::string&             Name,
           D3D9FixedFunctionOptions Options)
-  : m_module(spvVersion(1, 3)), m_options(Options) {
-    m_programType = DxsoProgramTypes::VertexShader;
-    m_vsKey    = Key;
-    m_filename = Name;
-  }
+  : m_filename    ( Name )
+  , m_module      ( spvVersion(1, 3) )
+  , m_programType ( DxsoProgramTypes::VertexShader )
+  , m_vsKey       ( Key )
+  , m_options     ( Options ) { }
 
 
   D3D9FFShaderCompiler::D3D9FFShaderCompiler(
@@ -826,11 +896,11 @@ namespace dxvk {
     const D3D9FFShaderKeyFS&       Key,
     const std::string&             Name,
           D3D9FixedFunctionOptions Options)
-  : m_module(spvVersion(1, 3)), m_options(Options) {
-    m_programType = DxsoProgramTypes::PixelShader;
-    m_fsKey    = Key;
-    m_filename = Name;
-  }
+  : m_filename    ( Name )
+  , m_module      ( spvVersion(1, 3) )
+  , m_programType ( DxsoProgramTypes::PixelShader )
+  , m_fsKey       ( Key )
+  , m_options     ( Options ) { }
 
 
   Rc<DxvkShader> D3D9FFShaderCompiler::compile() {
@@ -888,8 +958,9 @@ namespace dxvk {
     info.inputMask = m_inputMask;
     info.outputMask = m_outputMask;
     info.flatShadingInputs = m_flatShadingMask;
-    info.pushConstStages = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
-    info.pushConstSize = sizeof(D3D9RenderStateInfo);
+    info.sharedPushData = DxvkPushDataBlock(0u, sizeof(D3D9RenderStateInfo), 4u, 0u);
+    info.localPushData = m_samplerBlock;
+    info.samplerHeap = DxvkShaderBinding(VK_SHADER_STAGE_ALL, GetGlobalSamplerSetIndex(), 0u);
 
     return new DxvkShader(info, m_module.compile());
   }
@@ -1160,7 +1231,6 @@ namespace dxvk {
         case (DXVK_TSS_TCI_CAMERASPACEPOSITION >> TCIOffset):
           transformed = vtx;
           if (!applyTransform) {
-            Logger::warn(str::format("!applyTransform flags: ", flags, " projidx: ", projIndex));
             count = 3;
             projIndex = 4;
           }
@@ -1297,7 +1367,7 @@ namespace dxvk {
         uint32_t atten  = m_module.opFFma  (m_floatType, d, atten2, atten1);
                  atten  = m_module.opFFma  (m_floatType, d, atten,  atten0);
                  atten  = m_module.opFDiv  (m_floatType, m_module.constf32(1.0f), atten);
-                 atten  = m_module.opNMin  (m_floatType, atten, m_module.constf32(FLT_MAX));
+                 atten  = m_module.opNMin  (m_floatType, atten, m_module.constf32(std::numeric_limits<float>::max()));
 
                  atten  = m_module.opSelect(m_floatType, m_module.opFOrdGreaterThan(bool_t, d, range), m_module.constf32(0.0f), atten);
                  atten  = m_module.opSelect(m_floatType, isDirectional, m_module.constf32(1.0f), atten);
@@ -1408,8 +1478,19 @@ namespace dxvk {
   }
 
 
-  void D3D9FFShaderCompiler::setupRenderStateInfo() {
-    m_rsBlock = SetupRenderStateBlock(m_module);
+  void D3D9FFShaderCompiler::setupRenderStateInfo(VkShaderStageFlagBits stage, uint32_t samplerCount) {
+    auto blockInfo = SetupRenderStateBlock(m_module, (1u << samplerCount) - 1u);
+
+    m_rsBlock = blockInfo.first;
+    m_rsFirstSampler = blockInfo.second;
+
+    if (samplerCount)
+      m_samplerArray = SetupSamplerArray(m_module);
+
+    uint32_t samplerDwordCount = (samplerCount + 1u) / 2u;
+
+    m_samplerBlock = DxvkPushDataBlock(stage, GetPushSamplerOffset(0u),
+      samplerDwordCount * sizeof(uint32_t), sizeof(uint32_t), (1u << samplerDwordCount) - 1u);
   }
 
 
@@ -1597,12 +1678,13 @@ namespace dxvk {
     m_module.decorateDescriptorSet(m_vs.constantBuffer, 0);
     m_module.decorateBinding(m_vs.constantBuffer, bindingId);
 
-    DxvkBindingInfo binding = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER };
-    binding.resourceBinding = bindingId;
-    binding.viewType        = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+    auto& binding = m_bindings.emplace_back();
+    binding.set             = 0u;
+    binding.binding         = bindingId;
+    binding.resourceIndex   = bindingId;
+    binding.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     binding.access          = VK_ACCESS_UNIFORM_READ_BIT;
-    binding.uboSet          = VK_TRUE;
-    m_bindings.push_back(binding);
+    binding.flags.set(DxvkDescriptorFlag::UniformBuffer);
   }
 
 
@@ -1637,17 +1719,18 @@ namespace dxvk {
 
     m_module.decorate(m_vs.vertexBlendData, spv::DecorationNonWritable);
 
-    DxvkBindingInfo binding = { VK_DESCRIPTOR_TYPE_STORAGE_BUFFER };
-    binding.resourceBinding = bindingId;
-    binding.viewType        = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+    auto& binding = m_bindings.emplace_back();
+    binding.set             = 0u;
+    binding.binding         = bindingId;
+    binding.resourceIndex   = bindingId;
+    binding.descriptorType  = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
     binding.access          = VK_ACCESS_SHADER_READ_BIT;
-    binding.uboSet          = VK_TRUE;
-    m_bindings.push_back(binding);
+    binding.flags.set(DxvkDescriptorFlag::UniformBuffer);
   }
 
 
   void D3D9FFShaderCompiler::setupVS() {
-    setupRenderStateInfo();
+    setupRenderStateInfo(VK_SHADER_STAGE_VERTEX_BIT, 0u);
     m_specUbo = SetupSpecUBO(m_module, m_bindings);
 
     // VS Caps
@@ -1809,7 +1892,9 @@ namespace dxvk {
       auto GetTexture = [&]() {
         if (!processedTexture) {
           SpirvImageOperands imageOperands;
-          uint32_t imageVarId = m_module.opLoad(m_ps.samplers[i].typeId, m_ps.samplers[i].varId);
+          uint32_t imageVarId = m_module.opLoad(m_ps.samplers[i].imageTypeId, m_ps.samplers[i].imageVarId);
+          imageVarId = m_module.opSampledImage(m_ps.samplers[i].sampledTypeId, imageVarId,
+            LoadSampler(m_module, m_samplerArray, m_rsBlock, m_rsFirstSampler, m_ps.samplers[i].samplerIndex));
 
           uint32_t texcoordCnt = m_ps.samplers[i].texcoordCnt;
 
@@ -2196,7 +2281,7 @@ namespace dxvk {
   }
 
   void D3D9FFShaderCompiler::setupPS() {
-    setupRenderStateInfo();
+    setupRenderStateInfo(VK_SHADER_STAGE_FRAGMENT_BIT, 8u);
     m_specUbo = SetupSpecUBO(m_module, m_bindings);
 
     // PS Caps
@@ -2257,12 +2342,13 @@ namespace dxvk {
     m_module.decorateDescriptorSet(m_ps.constantBuffer, 0);
     m_module.decorateBinding(m_ps.constantBuffer, bindingId);
 
-    DxvkBindingInfo binding = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER };
-    binding.resourceBinding = bindingId;
-    binding.viewType        = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+    auto& binding = m_bindings.emplace_back();
+    binding.set             = 0u;
+    binding.binding         = bindingId;
+    binding.resourceIndex   = bindingId;
+    binding.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     binding.access          = VK_ACCESS_UNIFORM_READ_BIT;
-    binding.uboSet          = VK_TRUE;
-    m_bindings.push_back(binding);
+    binding.flags.set(DxvkDescriptorFlag::UniformBuffer);
 
     // Load constants
     auto LoadConstant = [&](uint32_t type, uint32_t idx) {
@@ -2307,33 +2393,39 @@ namespace dxvk {
           break;
       }
 
-      sampler.typeId = m_module.defImageType(
+      sampler.imageTypeId = m_module.defImageType(
         m_module.defFloatType(32),
         dimensionality, 0, 0, 0, 1,
         spv::ImageFormatUnknown);
-
-      sampler.typeId = m_module.defSampledImageType(sampler.typeId);
-
-      sampler.varId = m_module.newVar(
-        m_module.defPointerType(
-          sampler.typeId, spv::StorageClassUniformConstant),
+      sampler.imageVarId = m_module.newVar(
+        m_module.defPointerType(sampler.imageTypeId, spv::StorageClassUniformConstant),
         spv::StorageClassUniformConstant);
 
-      std::string name = str::format("s", i);
-      m_module.setDebugName(sampler.varId, name.c_str());
+      sampler.sampledTypeId = m_module.defSampledImageType(sampler.imageTypeId);
+      sampler.samplerIndex = i;
+
+      std::string name = str::format("t", i);
+      m_module.setDebugName(sampler.imageVarId, name.c_str());
 
       const uint32_t bindingId = computeResourceSlotId(DxsoProgramType::PixelShader,
-        DxsoBindingType::Image, i);
+        DxsoBindingType::Image, sampler.samplerIndex);
 
-      m_module.decorateDescriptorSet(sampler.varId, 0);
-      m_module.decorateBinding(sampler.varId, bindingId);
+      m_module.decorateDescriptorSet(sampler.imageVarId, 0);
+      m_module.decorateBinding(sampler.imageVarId, bindingId);
 
-      // Store descriptor info for the shader interface
-      DxvkBindingInfo binding = { VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER };
-      binding.resourceBinding = bindingId;
-      binding.viewType        = viewType;
-      binding.access          = VK_ACCESS_SHADER_READ_BIT;
-      m_bindings.push_back(binding);
+      auto& imageBinding = m_bindings.emplace_back();
+      imageBinding.set             = 0u;
+      imageBinding.binding         = bindingId;
+      imageBinding.resourceIndex   = bindingId;
+      imageBinding.descriptorType  = VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE;
+      imageBinding.viewType        = viewType;
+      imageBinding.access          = VK_ACCESS_SHADER_READ_BIT;
+
+      auto& samplerBinding = m_bindings.emplace_back();
+      samplerBinding.resourceIndex   = bindingId;
+      samplerBinding.descriptorType  = VK_DESCRIPTOR_TYPE_SAMPLER;
+      samplerBinding.blockOffset     = GetPushSamplerOffset(i);
+      samplerBinding.flags.set(DxvkDescriptorFlag::PushData);
     }
 
     emitPsSharedConstants();
@@ -2350,12 +2442,13 @@ namespace dxvk {
     m_module.decorateDescriptorSet(m_ps.sharedState, 0);
     m_module.decorateBinding(m_ps.sharedState, bindingId);
 
-    DxvkBindingInfo binding = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER };
-    binding.resourceBinding = bindingId;
-    binding.viewType        = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+    auto& binding = m_bindings.emplace_back();
+    binding.set             = 0u;
+    binding.binding         = bindingId;
+    binding.resourceIndex   = bindingId;
+    binding.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     binding.access          = VK_ACCESS_UNIFORM_READ_BIT;
-    binding.uboSet          = VK_TRUE;
-    m_bindings.push_back(binding);
+    binding.flags.set(DxvkDescriptorFlag::UniformBuffer);
   }
 
 
@@ -2366,6 +2459,7 @@ namespace dxvk {
     
     uint32_t floatType = m_module.defFloatType(32);
     uint32_t vec4Type  = m_module.defVectorType(floatType, 4);
+    uint32_t boolType  = m_module.defBoolType();
     
     // Declare uniform buffer containing clip planes
     uint32_t clipPlaneArray  = m_module.defArrayTypeUnique(vec4Type, clipPlaneCountId);
@@ -2390,12 +2484,13 @@ namespace dxvk {
     m_module.decorateDescriptorSet(clipPlaneBlock, 0);
     m_module.decorateBinding      (clipPlaneBlock, bindingId);
     
-    DxvkBindingInfo binding = { VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER };
-    binding.resourceBinding = bindingId;
-    binding.viewType        = VK_IMAGE_VIEW_TYPE_MAX_ENUM;
+    auto& binding = m_bindings.emplace_back();
+    binding.set             = 0u;
+    binding.binding         = bindingId;
+    binding.resourceIndex   = bindingId;
+    binding.descriptorType  = VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER;
     binding.access          = VK_ACCESS_UNIFORM_READ_BIT;
-    binding.uboSet          = VK_TRUE;
-    m_bindings.push_back(binding);
+    binding.flags.set(DxvkDescriptorFlag::UniformBuffer);
 
     // Declare output array for clip distances
     uint32_t clipDistArray = m_module.newVar(
@@ -2405,6 +2500,9 @@ namespace dxvk {
       spv::StorageClassOutput);
 
     m_module.decorateBuiltIn(clipDistArray, spv::BuiltInClipDistance);
+
+    // Always consider clip planes enabled when doing GPL by forcing 6 for the quick value.
+    uint32_t clipPlaneCount = m_spec.get(m_module, m_specUbo, SpecClipPlaneCount, 0, 32, m_module.constu32(caps::MaxClipPlanes));
 
     // Compute clip distances
     for (uint32_t i = 0; i < caps::MaxClipPlanes; i++) {
@@ -2419,12 +2517,14 @@ namespace dxvk {
           clipPlaneBlock, blockMembers.size(), blockMembers.data()));
       
       uint32_t distId = m_module.opDot(floatType, worldPos, planeId);
+
+      uint32_t clipPlaneEnabled = m_module.opULessThan(boolType, m_module.constu32(i), clipPlaneCount);
+
+      uint32_t value = m_module.opSelect(floatType, clipPlaneEnabled, distId, m_module.constf32(0.0f));
       
-      m_module.opStore(
-        m_module.opAccessChain(
-          m_module.defPointerType(floatType, spv::StorageClassOutput),
-          clipDistArray, 1, &blockMembers[1]),
-        distId);
+      m_module.opStore(m_module.opAccessChain(
+        m_module.defPointerType(floatType, spv::StorageClassOutput),
+        clipDistArray, 1, &blockMembers[1]), value);
     }
   }
 

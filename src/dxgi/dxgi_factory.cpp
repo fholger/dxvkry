@@ -9,10 +9,10 @@
 
 namespace dxvk {
 
-  Singleton<DxvkInstance> g_dxvkInstance;
+  static Singleton<DxvkInstance>   g_dxvkInstance;
 
-  std::mutex s_globalHDRStateMutex;
-  DXVK_VK_GLOBAL_HDR_STATE s_globalHDRState{};
+  static dxvk::mutex               s_globalHDRStateMutex;
+  static DXVK_VK_GLOBAL_HDR_STATE  s_globalHDRState{};
 
   DxgiVkFactory::DxgiVkFactory(DxgiFactory* pFactory)
   : m_factory(pFactory) {
@@ -84,7 +84,8 @@ namespace dxvk {
     m_options         (m_instance->config()),
     m_monitorInfo     (this, m_options),
     m_flags           (Flags),
-    m_monitorFallback (false) {
+    m_monitorFallback (false),
+    m_destructionNotifier(this) {
     // Be robust against situations where some monitors are not
     // associated with any adapter. This can happen if device
     // filter options are used.
@@ -101,11 +102,10 @@ namespace dxvk {
 
     for (uint32_t i = 0; m_instance->enumAdapters(i) != nullptr; i++) {
       auto adapter = m_instance->enumAdapters(i);
-      adapter->logAdapterInfo();
 
       // Remove all monitors that are associated
       // with the current adapter from the list.
-      const auto& vk11 = adapter->devicePropertiesExt().vk11;
+      const auto& vk11 = adapter->deviceProperties().vk11;
 
       if (vk11.deviceLUIDValid) {
         auto luid = reinterpret_cast<const LUID*>(&vk11.deviceLUID);
@@ -166,6 +166,11 @@ namespace dxvk {
       *ppvObject = ref(&m_monitorInfo);
       return S_OK;
     }
+
+    if (riid == __uuidof(ID3DDestructionNotifier)) {
+      *ppvObject = ref(&m_destructionNotifier);
+      return S_OK;
+    }
     
     if (logQueryInterfaceError(__uuidof(IDXGIFactory), riid)) {
       Logger::warn("DxgiFactory::QueryInterface: Unknown interface query");
@@ -207,9 +212,9 @@ namespace dxvk {
           IUnknown*             pDevice,
           DXGI_SWAP_CHAIN_DESC* pDesc,
           IDXGISwapChain**      ppSwapChain) {
-    if (ppSwapChain == nullptr || pDesc == nullptr || pDevice == nullptr)
+    if (!ppSwapChain || !pDesc || !pDesc->OutputWindow || !pDevice)
       return DXGI_ERROR_INVALID_CALL;
-    
+
     DXGI_SWAP_CHAIN_DESC1 desc;
     desc.Width              = pDesc->BufferDesc.Width;
     desc.Height             = pDesc->BufferDesc.Height;
@@ -222,7 +227,7 @@ namespace dxvk {
     desc.SwapEffect         = pDesc->SwapEffect;
     desc.AlphaMode          = DXGI_ALPHA_MODE_IGNORE;
     desc.Flags              = pDesc->Flags;
-    
+
     DXGI_SWAP_CHAIN_FULLSCREEN_DESC descFs;
     descFs.RefreshRate      = pDesc->BufferDesc.RefreshRate;
     descFs.ScanlineOrdering = pDesc->BufferDesc.ScanlineOrdering;
@@ -230,11 +235,10 @@ namespace dxvk {
     descFs.Windowed         = pDesc->Windowed;
     
     IDXGISwapChain1* swapChain = nullptr;
-    HRESULT hr = CreateSwapChainForHwndBase(
-      pDevice, pDesc->OutputWindow,
-      &desc, &descFs, nullptr,
-      &swapChain);
-    
+
+    HRESULT hr = CreateSwapChainBase(pDevice,
+      pDesc->OutputWindow, &desc, &descFs, nullptr, &swapChain);
+
     *ppSwapChain = swapChain;
     return hr;
   }
@@ -247,73 +251,17 @@ namespace dxvk {
     const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFullscreenDesc,
           IDXGIOutput*          pRestrictToOutput,
           IDXGISwapChain1**     ppSwapChain) {
-    return CreateSwapChainForHwndBase(
-      pDevice, hWnd,
+    InitReturnPtr(ppSwapChain);
+
+    if (!ppSwapChain || !pDesc || !hWnd || !pDevice)
+      return DXGI_ERROR_INVALID_CALL;
+
+    return CreateSwapChainBase(pDevice, hWnd,
       pDesc, pFullscreenDesc, pRestrictToOutput,
       ppSwapChain);
   }
 
-  HRESULT STDMETHODCALLTYPE DxgiFactory::CreateSwapChainForHwndBase(
-          IUnknown*             pDevice,
-          HWND                  hWnd,
-    const DXGI_SWAP_CHAIN_DESC1* pDesc,
-    const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFullscreenDesc,
-          IDXGIOutput*          pRestrictToOutput,
-          IDXGISwapChain1**     ppSwapChain) {
-    InitReturnPtr(ppSwapChain);
-    
-    if (!ppSwapChain || !pDesc || !hWnd || !pDevice)
-      return DXGI_ERROR_INVALID_CALL;
-    
-    // Make sure the back buffer size is not zero
-    DXGI_SWAP_CHAIN_DESC1 desc = *pDesc;
 
-    wsi::getWindowSize(hWnd,
-      desc.Width  ? nullptr : &desc.Width,
-      desc.Height ? nullptr : &desc.Height);
-
-    // If necessary, set up a default set of
-    // fullscreen parameters for the swap chain
-    DXGI_SWAP_CHAIN_FULLSCREEN_DESC fsDesc;
-
-    if (pFullscreenDesc) {
-      fsDesc = *pFullscreenDesc;
-    } else {
-      fsDesc.RefreshRate      = { 0, 0 };
-      fsDesc.ScanlineOrdering = DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED;
-      fsDesc.Scaling          = DXGI_MODE_SCALING_UNSPECIFIED;
-      fsDesc.Windowed         = TRUE;
-    }
-
-    // Probe various modes to create the swap chain object
-    Com<IDXGISwapChain4> frontendSwapChain;
-
-    Com<IDXGIVkSwapChainFactory> dxvkFactory;
-
-    if (SUCCEEDED(pDevice->QueryInterface(IID_PPV_ARGS(&dxvkFactory)))) {
-      Com<IDXGIVkSurfaceFactory> surfaceFactory = new DxgiSurfaceFactory(
-        m_instance->vki()->getLoaderProc(), hWnd);
-
-      Com<IDXGIVkSwapChain> presenter;
-      HRESULT hr = dxvkFactory->CreateSwapChain(surfaceFactory.ptr(), &desc, &presenter);
-
-      if (FAILED(hr)) {
-        Logger::err(str::format("DXGI: CreateSwapChainForHwnd: Failed to create swap chain, hr ", hr));
-        return hr;
-      }
-
-      frontendSwapChain = new DxgiSwapChain(this, presenter.ptr(), hWnd, &desc, &fsDesc, pDevice);
-    } else {
-      Logger::err("DXGI: CreateSwapChainForHwnd: Unsupported device type");
-      return DXGI_ERROR_UNSUPPORTED;
-    }
-    
-    // Wrap object in swap chain dispatcher
-    *ppSwapChain = new DxgiSwapChainDispatcher(frontendSwapChain.ref(), pDevice);
-    return S_OK;
-  }
-  
-  
   HRESULT STDMETHODCALLTYPE DxgiFactory::CreateSwapChainForCoreWindow(
           IUnknown*             pDevice,
           IUnknown*             pWindow,
@@ -333,9 +281,16 @@ namespace dxvk {
           IDXGIOutput*          pRestrictToOutput,
           IDXGISwapChain1**     ppSwapChain) {
     InitReturnPtr(ppSwapChain);
-    
-    Logger::err("DxgiFactory::CreateSwapChainForComposition: Not implemented");
-    return E_NOTIMPL;
+
+    if (!m_options.enableDummyCompositionSwapchain) {
+      Logger::err("DxgiFactory::CreateSwapChainForComposition: Not implemented");
+      return E_NOTIMPL;
+    }
+
+    Logger::warn("DxgiFactory::CreateSwapChainForComposition: Creating dummy swap chain");
+
+    return CreateSwapChainBase(pDevice,
+      nullptr, pDesc, nullptr, pRestrictToOutput, ppSwapChain);
   }
   
   
@@ -559,6 +514,64 @@ namespace dxvk {
           DWORD                 Cookie) {
     Logger::err("DxgiFactory: UnregisterAdaptersChangedEvent: Stub");
     return E_NOTIMPL;
+  }
+
+
+  HRESULT STDMETHODCALLTYPE DxgiFactory::CreateSwapChainBase(
+          IUnknown*             pDevice,
+          HWND                  hWnd,
+    const DXGI_SWAP_CHAIN_DESC1* pDesc,
+    const DXGI_SWAP_CHAIN_FULLSCREEN_DESC* pFullscreenDesc,
+          IDXGIOutput*          pRestrictToOutput,
+          IDXGISwapChain1**     ppSwapChain) {
+    // Make sure the back buffer size is not zero
+    DXGI_SWAP_CHAIN_DESC1 desc = *pDesc;
+
+    if (hWnd) {
+      wsi::getWindowSize(hWnd,
+        desc.Width  ? nullptr : &desc.Width,
+        desc.Height ? nullptr : &desc.Height);
+    }
+
+    // If necessary, set up a default set of
+    // fullscreen parameters for the swap chain
+    DXGI_SWAP_CHAIN_FULLSCREEN_DESC fsDesc;
+
+    if (pFullscreenDesc) {
+      fsDesc = *pFullscreenDesc;
+    } else {
+      fsDesc.RefreshRate      = { 0, 0 };
+      fsDesc.ScanlineOrdering = DXGI_MODE_SCANLINE_ORDER_UNSPECIFIED;
+      fsDesc.Scaling          = DXGI_MODE_SCALING_UNSPECIFIED;
+      fsDesc.Windowed         = TRUE;
+    }
+
+    // Probe various modes to create the swap chain object
+    Com<IDXGISwapChain4> frontendSwapChain;
+
+    Com<IDXGIVkSwapChainFactory> dxvkFactory;
+
+    if (SUCCEEDED(pDevice->QueryInterface(IID_PPV_ARGS(&dxvkFactory)))) {
+      Com<IDXGIVkSurfaceFactory> surfaceFactory = new DxgiSurfaceFactory(
+        m_instance->vki()->getLoaderProc(), hWnd);
+
+      Com<IDXGIVkSwapChain> presenter;
+      HRESULT hr = dxvkFactory->CreateSwapChain(surfaceFactory.ptr(), &desc, &presenter);
+
+      if (FAILED(hr)) {
+        Logger::err(str::format("DXGI: CreateSwapChainForHwnd: Failed to create swap chain, hr ", hr));
+        return hr;
+      }
+
+      frontendSwapChain = new DxgiSwapChain(this, presenter.ptr(), hWnd, &desc, &fsDesc, pDevice);
+    } else {
+      Logger::err("DXGI: CreateSwapChainForHwnd: Unsupported device type");
+      return DXGI_ERROR_UNSUPPORTED;
+    }
+
+    // Wrap object in swap chain dispatcher
+    *ppSwapChain = new DxgiSwapChainDispatcher(frontendSwapChain.ref(), pDevice);
+    return S_OK;
   }
 
 

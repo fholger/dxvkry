@@ -46,12 +46,18 @@ namespace dxvk {
     /// Enable HDR
     bool enableHDR;
 
+    /// Enable support for dummy composition swapchains
+    bool enableDummyCompositionSwapchain;
+
     /// Limit frame rate
     int32_t maxFrameRate;
 
     /// Sync interval. Overrides the value
     /// passed to IDXGISwapChain::Present.
     int32_t syncInterval;
+
+    /// Forced refresh rate, disable other modes
+    uint32_t forceRefreshRate;
   };
   
 }

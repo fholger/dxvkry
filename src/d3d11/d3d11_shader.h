@@ -18,7 +18,7 @@
 namespace dxvk {
   
   class D3D11Device;
-  
+
   /**
    * \brief Common shader object
    * 
@@ -52,12 +52,18 @@ namespace dxvk {
     std::string GetName() const {
       return m_shader->debugName();
     }
-    
+
+    DxbcBindingMask GetBindingMask() const {
+      return m_bindings;
+    }
+
   private:
-    
+
     Rc<DxvkShader> m_shader;
     Rc<DxvkBuffer> m_buffer;
-    
+
+    DxbcBindingMask m_bindings = { };
+
   };
 
 
@@ -108,7 +114,8 @@ namespace dxvk {
     
     D3D11Shader(D3D11Device* device, const D3D11CommonShader& shader)
     : D3D11DeviceChild<D3D11Interface>(device),
-      m_shader(shader), m_d3d10(this), m_shaderExt(this, &m_shader) { }
+      m_shader(shader), m_d3d10(this), m_shaderExt(this, &m_shader),
+      m_destructionNotifier(this) { }
     
     ~D3D11Shader() { }
     
@@ -134,6 +141,11 @@ namespace dxvk {
         return S_OK;
       }
 
+      if (riid == __uuidof(ID3DDestructionNotifier)) {
+        *ppvObject = ref(&m_destructionNotifier);
+        return S_OK;
+      }
+
       if (logQueryInterfaceError(__uuidof(D3D11Interface), riid)) {
         Logger::warn("D3D11Shader::QueryInterface: Unknown interface query");
         Logger::warn(str::format(riid));
@@ -155,6 +167,8 @@ namespace dxvk {
     D3D11CommonShader m_shader;
     D3D10ShaderClass  m_d3d10;
     D3D11ExtShader    m_shaderExt;
+
+    D3DDestructionNotifier m_destructionNotifier;
     
   };
   

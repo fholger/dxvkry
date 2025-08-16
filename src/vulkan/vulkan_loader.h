@@ -28,7 +28,6 @@ namespace dxvk { namespace vk {
     PFN_vkVoidFunction sym(VkInstance instance, const char* name) const;
     PFN_vkVoidFunction sym(const char* name) const;
     PFN_vkGetInstanceProcAddr getLoaderProc() const { return m_getInstanceProcAddr; }
-    bool               valid() const;
   protected:
     HMODULE                   m_library             = nullptr;
     PFN_vkGetInstanceProcAddr m_getInstanceProcAddr = nullptr;
@@ -364,6 +363,20 @@ namespace dxvk { namespace vk {
     VULKAN_FN(vkCmdEndConditionalRenderingEXT);
     #endif
 
+    #ifdef VK_EXT_descriptor_buffer
+    VULKAN_FN(vkGetDescriptorSetLayoutSizeEXT);
+    VULKAN_FN(vkGetDescriptorSetLayoutBindingOffsetEXT);
+    VULKAN_FN(vkGetDescriptorEXT);
+    VULKAN_FN(vkCmdBindDescriptorBuffersEXT);
+    VULKAN_FN(vkCmdSetDescriptorBufferOffsetsEXT);
+    VULKAN_FN(vkCmdBindDescriptorBufferEmbeddedSamplersEXT);
+    VULKAN_FN(vkGetBufferOpaqueCaptureDescriptorDataEXT);
+    VULKAN_FN(vkGetImageOpaqueCaptureDescriptorDataEXT);
+    VULKAN_FN(vkGetImageViewOpaqueCaptureDescriptorDataEXT);
+    VULKAN_FN(vkGetSamplerOpaqueCaptureDescriptorDataEXT);
+    VULKAN_FN(vkGetAccelerationStructureOpaqueCaptureDescriptorDataEXT);
+    #endif
+
     #ifdef VK_EXT_debug_utils
     VULKAN_FN(vkQueueBeginDebugUtilsLabelEXT);
     VULKAN_FN(vkQueueEndDebugUtilsLabelEXT);
@@ -399,6 +412,15 @@ namespace dxvk { namespace vk {
 
     #ifdef VK_EXT_hdr_metadata
     VULKAN_FN(vkSetHdrMetadataEXT);
+    #endif
+
+    #ifdef VK_EXT_pageable_device_local_memory
+    VULKAN_FN(vkSetDeviceMemoryPriorityEXT);
+    #endif
+
+    #ifdef VK_EXT_multi_draw
+    VULKAN_FN(vkCmdDrawMultiEXT);
+    VULKAN_FN(vkCmdDrawMultiIndexedEXT);
     #endif
 
     #ifdef VK_EXT_shader_module_identifier
@@ -445,6 +467,15 @@ namespace dxvk { namespace vk {
     VULKAN_FN(vkGetImageSubresourceLayout2KHR);
     #endif
 
+    #ifdef VK_KHR_maintenance6
+    VULKAN_FN(vkCmdBindDescriptorSets2KHR);
+    VULKAN_FN(vkCmdPushConstants2KHR);
+    VULKAN_FN(vkCmdPushDescriptorSet2KHR);
+    VULKAN_FN(vkCmdPushDescriptorSetWithTemplate2KHR);
+    VULKAN_FN(vkCmdSetDescriptorBufferOffsets2EXT);
+    VULKAN_FN(vkCmdBindDescriptorBufferEmbeddedSamplers2EXT);
+    #endif
+
     #ifdef VK_KHR_present_wait
     VULKAN_FN(vkWaitForPresentKHR);
     #endif
@@ -453,6 +484,14 @@ namespace dxvk { namespace vk {
     // Wine additions to actually use this extension.
     VULKAN_FN(wine_vkAcquireKeyedMutex);
     VULKAN_FN(wine_vkReleaseKeyedMutex);
+    #endif
+
+    #ifdef VK_NV_low_latency2
+    VULKAN_FN(vkSetLatencySleepModeNV);
+    VULKAN_FN(vkLatencySleepNV);
+    VULKAN_FN(vkSetLatencyMarkerNV);
+    VULKAN_FN(vkGetLatencyTimingsNV);
+    VULKAN_FN(vkQueueNotifyOutOfBandNV);
     #endif
   };
   

@@ -4,6 +4,9 @@ wsi_src = [
   'win32/wsi_monitor_win32.cpp',
   'win32/wsi_platform_win32.cpp',
   'win32/wsi_window_win32.cpp',
+  'sdl3/wsi_monitor_sdl3.cpp',
+  'sdl3/wsi_platform_sdl3.cpp',
+  'sdl3/wsi_window_sdl3.cpp',
   'sdl2/wsi_monitor_sdl2.cpp',
   'sdl2/wsi_platform_sdl2.cpp',
   'sdl2/wsi_window_sdl2.cpp',
@@ -14,8 +17,12 @@ wsi_src = [
 
 wsi_deps = [ dep_displayinfo ]
 
-if platform != 'windows'
+if platform == 'windows'
+  lib_setupapi = cpp.find_library('setupapi')
+  wsi_deps += [ lib_setupapi ]
+else
   wsi_deps += [
+    lib_sdl3.partial_dependency(compile_args: true, includes: true),
     lib_sdl2.partial_dependency(compile_args: true, includes: true),
     lib_glfw.partial_dependency(compile_args: true, includes: true),
   ]

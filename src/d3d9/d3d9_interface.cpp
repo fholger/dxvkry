@@ -13,7 +13,7 @@ namespace dxvk {
 
   Singleton<DxvkInstance> g_dxvkInstance;
 
-  D3D9InterfaceEx::D3D9InterfaceEx(bool bExtended)
+  D3D9InterfaceEx::D3D9InterfaceEx(bool bExtended, const D3D9ON12_ARGS* pOverrideList, uint32_t OverrideCount)
     : m_instance    ( g_dxvkInstance.acquire(DxvkInstanceFlag::ClientApiIsD3D9) )
     , m_d3d8Bridge  ( this )
     , m_extended    ( bExtended ) 
@@ -47,8 +47,10 @@ namespace dxvk {
           ? m_instance->enumAdapters(0)
           : m_instance->enumAdapters(adapterOrdinal);
 
-        if (adapter != nullptr)
-          m_adapters.emplace_back(this, adapter, adapterOrdinal++, i - 1);
+        if (adapter != nullptr) {
+          const auto* d3d9On12Args = Find9On12Args(adapter, pOverrideList, OverrideCount);
+          m_adapters.emplace_back(this, d3d9On12Args, adapter, adapterOrdinal++, i - 1);
+        }
       }
     }
     else
@@ -57,8 +59,10 @@ namespace dxvk {
       const uint32_t adapterCount = m_instance->adapterCount();
       m_adapters.reserve(adapterCount);
 
-      for (uint32_t i = 0; i < adapterCount; i++)
-        m_adapters.emplace_back(this, m_instance->enumAdapters(i), i, 0);
+      for (uint32_t i = 0; i < adapterCount; i++) {
+        const auto* d3d9On12Args = Find9On12Args(m_instance->enumAdapters(i), pOverrideList, OverrideCount);
+        m_adapters.emplace_back(this, d3d9On12Args, m_instance->enumAdapters(i), i, 0);
+      }
     }
 
 #ifdef _WIN32
@@ -67,6 +71,9 @@ namespace dxvk {
       SetProcessDPIAware();
     }
 #endif
+
+    if (unlikely(m_d3d9Options.shaderModel == 0))
+      Logger::warn("D3D9InterfaceEx: WARNING! Fixed-function exclusive mode is enabled.");
   }
 
 
@@ -93,7 +100,8 @@ namespace dxvk {
       return S_OK;
     }
 
-    if (riid == __uuidof(ID3D9VkInteropInterface)) {
+    if (riid == __uuidof(ID3D9VkInteropInterface)
+     || riid == __uuidof(ID3D9VkInteropInterface1)) {
       *ppvObject = ref(&m_d3d9Interop);
       return S_OK;
     }
@@ -350,15 +358,34 @@ namespace dxvk {
           IDirect3DDevice9Ex**   ppReturnedDeviceInterface) {
     InitReturnPtr(ppReturnedDeviceInterface);
 
-    if (ppReturnedDeviceInterface == nullptr
-    || pPresentationParameters    == nullptr)
+    if (unlikely(ppReturnedDeviceInterface  == nullptr
+              || pPresentationParameters    == nullptr))
       return D3DERR_INVALIDCALL;
 
-    // creating a device with D3DCREATE_PUREDEVICE only works in conjunction
-    // with D3DCREATE_HARDWARE_VERTEXPROCESSING on native drivers
-    if (BehaviorFlags & D3DCREATE_PUREDEVICE &&
-    !(BehaviorFlags & D3DCREATE_HARDWARE_VERTEXPROCESSING))
+    if (unlikely(DeviceType == D3DDEVTYPE_SW))
       return D3DERR_INVALIDCALL;
+
+    // D3DDEVTYPE_REF devices can be created with D3D8, but not
+    // with D3D9, unless the Windows SDK 8.0 or later is installed.
+    // Report it unavailable, as it would be on most end-user systems.
+    if (unlikely(DeviceType == D3DDEVTYPE_REF && !m_isD3D8Compatible))
+      return D3DERR_NOTAVAILABLE;
+
+    // Creating a device with D3DCREATE_PUREDEVICE only works in conjunction
+    // with D3DCREATE_HARDWARE_VERTEXPROCESSING on native drivers.
+    if (unlikely(BehaviorFlags & D3DCREATE_PUREDEVICE &&
+               !(BehaviorFlags & D3DCREATE_HARDWARE_VERTEXPROCESSING)))
+      return D3DERR_INVALIDCALL;
+
+    HRESULT hr;
+    // Black Desert creates a D3DDEVTYPE_NULLREF device and
+    // expects it be created despite passing invalid parameters.
+    if (likely(DeviceType != D3DDEVTYPE_NULLREF)) {
+      hr = ValidatePresentationParameters(pPresentationParameters);
+
+      if (unlikely(FAILED(hr)))
+        return hr;
+    }
 
     auto* adapter = GetAdapter(Adapter);
 
@@ -368,7 +395,7 @@ namespace dxvk {
     auto dxvkAdapter = adapter->GetDXVKAdapter();
 
     try {
-      auto dxvkDevice = dxvkAdapter->createDevice(m_instance, D3D9DeviceEx::GetDeviceFeatures(dxvkAdapter));
+      auto dxvkDevice = dxvkAdapter->createDevice();
 
       auto* device = new D3D9DeviceEx(
         this,
@@ -378,9 +405,9 @@ namespace dxvk {
         BehaviorFlags,
         dxvkDevice);
 
-      HRESULT hr = device->InitialReset(pPresentationParameters, pFullscreenDisplayMode);
+      hr = device->InitialReset(pPresentationParameters, pFullscreenDisplayMode);
 
-      if (FAILED(hr))
+      if (unlikely(FAILED(hr)))
         return hr;
 
       *ppReturnedDeviceInterface = ref(device);
@@ -399,6 +426,92 @@ namespace dxvk {
       return adapter->GetAdapterLUID(pLUID);
 
     return D3DERR_INVALIDCALL;
+  }
+
+
+  HRESULT D3D9InterfaceEx::ValidatePresentationParameters(D3DPRESENT_PARAMETERS* pPresentationParameters) {
+    if (m_extended) {
+      // The swap effect value on a D3D9Ex device
+      // can not be higher than D3DSWAPEFFECT_FLIPEX.
+      if (unlikely(pPresentationParameters->SwapEffect > D3DSWAPEFFECT_FLIPEX))
+        return D3DERR_INVALIDCALL;
+
+      // 30 is the highest supported back buffer count for Ex devices.
+      if (unlikely(pPresentationParameters->BackBufferCount > D3DPRESENT_BACK_BUFFERS_MAX_EX))
+        return D3DERR_INVALIDCALL;
+    } else {
+      // The swap effect value on a non-Ex D3D9 device
+      // can not be higher than D3DSWAPEFFECT_COPY.
+      if (unlikely(pPresentationParameters->SwapEffect > D3DSWAPEFFECT_COPY))
+        return D3DERR_INVALIDCALL;
+
+      // 3 is the highest supported back buffer count for non-Ex devices.
+      if (unlikely(pPresentationParameters->BackBufferCount > D3DPRESENT_BACK_BUFFERS_MAX))
+        return D3DERR_INVALIDCALL;
+    }
+
+    // The swap effect value can not be 0.
+    if (unlikely(!pPresentationParameters->SwapEffect))
+      return D3DERR_INVALIDCALL;
+
+    // D3DSWAPEFFECT_COPY can not be used with more than one back buffer.
+    // Allow D3DSWAPEFFECT_COPY to bypass this restriction in D3D8 compatibility
+    // mode, since it may be a remapping of D3DSWAPEFFECT_COPY_VSYNC and RC Cars
+    // depends on it not being validated.
+    if (unlikely(!IsD3D8Compatible()
+              && pPresentationParameters->SwapEffect == D3DSWAPEFFECT_COPY
+              && pPresentationParameters->BackBufferCount > 1))
+      return D3DERR_INVALIDCALL;
+
+    // Valid fullscreen presentation intervals must be known values.
+    if (unlikely(!pPresentationParameters->Windowed
+            && !(pPresentationParameters->PresentationInterval == D3DPRESENT_INTERVAL_DEFAULT
+              || pPresentationParameters->PresentationInterval == D3DPRESENT_INTERVAL_ONE
+              || pPresentationParameters->PresentationInterval == D3DPRESENT_INTERVAL_TWO
+              || pPresentationParameters->PresentationInterval == D3DPRESENT_INTERVAL_THREE
+              || pPresentationParameters->PresentationInterval == D3DPRESENT_INTERVAL_FOUR
+              || pPresentationParameters->PresentationInterval == D3DPRESENT_INTERVAL_IMMEDIATE)))
+      return D3DERR_INVALIDCALL;
+
+    // In windowed mode, only a subset of the presentation interval flags can be used.
+    if (unlikely(pPresentationParameters->Windowed
+            && !(pPresentationParameters->PresentationInterval == D3DPRESENT_INTERVAL_DEFAULT
+              || pPresentationParameters->PresentationInterval == D3DPRESENT_INTERVAL_ONE
+              || pPresentationParameters->PresentationInterval == D3DPRESENT_INTERVAL_IMMEDIATE)))
+      return D3DERR_INVALIDCALL;
+
+    return D3D_OK;
+  }
+
+
+  const D3D9ON12_ARGS* D3D9InterfaceEx::Find9On12Args(
+    const Rc<DxvkAdapter>& Adapter,
+    const D3D9ON12_ARGS*   pOverrides,
+          uint32_t         OverrideCount) {
+    const D3D9ON12_ARGS* arg = nullptr;
+
+#ifdef _WIN32
+    for (uint32_t i = 0u; i < OverrideCount; i++) {
+      if (pOverrides[i].pD3D12Device) {
+        const auto& vk11 = Adapter->deviceProperties().vk11;
+
+        if (vk11.deviceLUIDValid) {
+          Com<ID3D12Device> device = nullptr;
+
+          if (SUCCEEDED(pOverrides[i].pD3D12Device->QueryInterface(__uuidof(ID3D12Device), reinterpret_cast<void**>(&device)))) {
+            LUID luid = device->GetAdapterLuid();
+
+            if (!std::memcmp(&luid, vk11.deviceLUID, sizeof(vk11.deviceLUID)))
+              arg = &pOverrides[i];
+          }
+        }
+      } else if (!arg) {
+        arg = &pOverrides[i];
+      }
+    }
+#endif
+
+    return arg;
   }
 
 }

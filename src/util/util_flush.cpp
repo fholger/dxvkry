@@ -2,9 +2,8 @@
 
 namespace dxvk {
 
-  GpuFlushTracker::GpuFlushTracker(
-          bool ensureReproducibleHeuristic)
-  : m_ensureReproducibleHeuristic(ensureReproducibleHeuristic) {
+  GpuFlushTracker::GpuFlushTracker(GpuFlushType maxType)
+  : m_maxType(maxType) {
 
   }
 
@@ -23,7 +22,7 @@ namespace dxvk {
     if (!chunkCount)
       return false;
 
-    if (m_ensureReproducibleHeuristic && flushType != GpuFlushType::ExplicitFlush)
+    if (flushType > m_maxType)
       return false;
 
     // Take any earlier missed flush with a stronger hint into account, so
@@ -69,6 +68,9 @@ namespace dxvk {
         uint32_t threshold = std::min(maxChunkCount, pendingSubmissions * minChunkCount);
         return chunkCount >= threshold;
       }
+
+      case GpuFlushType::None:
+        return false;
     }
 
     // Should be unreachable
@@ -79,7 +81,7 @@ namespace dxvk {
   void GpuFlushTracker::notifyFlush(
           uint64_t              chunkId,
           uint64_t              submissionId) {
-    m_lastMissedType = GpuFlushType::ImplicitWeakHint;
+    m_lastMissedType = GpuFlushType::None;
 
     m_lastFlushChunkId = chunkId;
     m_lastFlushSubmissionId = submissionId;

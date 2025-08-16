@@ -25,9 +25,6 @@ namespace dxvk {
     /// Whether or not we should care about pow(0, 0) = 1
     bool strictPow;
 
-    /// Max version of shader to support
-    uint32_t shaderModel;
-
     /// Work around a NV driver quirk
     /// Fixes flickering/z-fighting in some games.
     bool invariantPosition;
@@ -44,6 +41,9 @@ namespace dxvk {
 
     /// Whether or not we can rely on robustness2 to handle oob constant access
     bool robustness2Supported;
+
+    /// Whether or not we need to use custom sincos
+    bool sincosEmulation = false;
 
     /// Whether runtime to apply Dref scaling for depth textures of specified bit depth
     /// (24: D24S8, 16: D16, 0: Disabled). This allows compatability with games

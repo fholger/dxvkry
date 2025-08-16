@@ -6,7 +6,6 @@
 
 #include <vector>
 #include <cstdint>
-#include <climits>
 
 namespace dxvk {
 
@@ -16,7 +15,9 @@ namespace dxvk {
   // Vertex buffer that can handle many tiny locks while
   // still maintaing the lock ordering of direct-mapped buffers.
   class D3D8BatchBuffer final : public D3D8VertexBuffer {
+
   public:
+
     D3D8BatchBuffer(
         D3D8Device*                         pDevice,
         D3DPOOL                             Pool,
@@ -32,16 +33,16 @@ namespace dxvk {
             UINT   OffsetToLock,
             UINT   SizeToLock,
             BYTE** ppbData,
-            DWORD  Flags) {
+            DWORD  Flags) final {
       *ppbData = m_data.data() + OffsetToLock;
       return D3D_OK;
     }
 
-    HRESULT STDMETHODCALLTYPE Unlock() {
+    HRESULT STDMETHODCALLTYPE Unlock() final {
       return D3D_OK;
     }
 
-    HRESULT STDMETHODCALLTYPE GetDesc(D3DVERTEXBUFFER_DESC* pDesc) {
+    HRESULT STDMETHODCALLTYPE GetDesc(D3DVERTEXBUFFER_DESC* pDesc) final {
       if (unlikely(pDesc == nullptr))
         return D3DERR_INVALIDCALL;
 
@@ -55,7 +56,7 @@ namespace dxvk {
       return D3D_OK;
     }
 
-    void STDMETHODCALLTYPE PreLoad() {
+    void STDMETHODCALLTYPE PreLoad() final {
     }
 
     const void* GetPtr(UINT byteOffset = 0) const {
@@ -67,11 +68,13 @@ namespace dxvk {
     }
 
   private:
+
     std::vector<BYTE> m_data;
     DWORD             m_fvf;
+
   };
 
-  
+
   // Main handler for batching D3D8 draw calls.
   class D3D8Batcher {
 
@@ -79,13 +82,14 @@ namespace dxvk {
       D3DPRIMITIVETYPE PrimitiveType = D3DPT_INVALID;
       std::vector<uint16_t> Indices;
       UINT Offset = 0;
-      UINT MinVertex = UINT_MAX;
+      UINT MinVertex = std::numeric_limits<uint32_t>::max();
       UINT MaxVertex = 0;
       UINT PrimitiveCount = 0;
       UINT DrawCallCount = 0;
     };
 
   public:
+
     D3D8Batcher(D3D8Device* pDevice8, Com<d3d9::IDirect3DDevice9>&& pDevice9)
       : m_device8(pDevice8)
       , m_device(std::move(pDevice9)) {
@@ -115,13 +119,13 @@ namespace dxvk {
           d3d9::D3DFMT_INDEX16,
           m_stream->GetPtr(draw.MinVertex * m_stride),
           m_stride);
-        
+
         m_device->SetStreamSource(0, D3D8VertexBuffer::GetD3D9Nullable(m_stream), 0, m_stride);
         m_device->SetIndices(D3D8IndexBuffer::GetD3D9Nullable(m_indices));
-        
+
         draw.PrimitiveType = D3DPRIMITIVETYPE(0);
         draw.Offset = 0;
-        draw.MinVertex = UINT_MAX;
+        draw.MinVertex = std::numeric_limits<uint32_t>::max();
         draw.MaxVertex = 0;
         draw.PrimitiveCount = 0;
         draw.DrawCallCount = 0;
@@ -231,6 +235,7 @@ namespace dxvk {
     }
 
   private:
+
     D3D8Device*                     m_device8;
     Com<d3d9::IDirect3DDevice9>     m_device;
 
@@ -239,5 +244,7 @@ namespace dxvk {
     D3D8IndexBuffer*                m_indices = nullptr;
     INT                             m_baseVertexIndex = 0;
     std::array<Batch, D3DPT_COUNT>  m_batches;
+
   };
+
 }

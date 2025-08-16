@@ -78,11 +78,36 @@ namespace dxvk {
 
         if (!adjusted.empty()) {
 #ifdef _WIN32
-          if (m_wineLogOutput)
-            m_wineLogOutput(adjusted.c_str());
-          else
-            std::cerr << adjusted;
+          if (m_wineLogOutput) {
+            // __wine_dbg_output tries to buffer lines up to 1020 characters
+            // including null terminator, and will cause a hang if we submit
+            // anything longer than that even in consecutive calls. Work
+            // around this by splitting long lines into multiple lines.
+            constexpr size_t MaxDebugBufferLength = 1018;
+
+            if (adjusted.size() <= MaxDebugBufferLength) {
+              m_wineLogOutput(adjusted.c_str());
+            } else {
+              std::array<char, MaxDebugBufferLength + 2u> buffer;
+
+              for (size_t i = 0; i < adjusted.size(); i += MaxDebugBufferLength) {
+                size_t size = std::min(adjusted.size() - i, MaxDebugBufferLength);
+
+                std::strncpy(buffer.data(), &adjusted[i], size);
+                if (buffer[size - 1u] != '\n')
+                  buffer[size++] = '\n';
+
+                buffer[size] = '\0';
+                m_wineLogOutput(buffer.data());
+              }
+            }
+          }
+
+          // Don't log anything to stderr if we're not on wine. Usually games are
+          // compiled as gui apps anyway, and emitting anything to the standard
+          // output streams can crash certain games.
 #else
+          // For native builds, logging to stderr should be fine.
           std::cerr << adjusted;
 #endif
         }

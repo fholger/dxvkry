@@ -7,6 +7,8 @@
 
 #include "../../util/util_time.h"
 
+#include "../dxvk_gpu_query.h"
+
 #include "dxvk_hud_renderer.h"
 
 namespace dxvk::hud {
@@ -33,13 +35,18 @@ namespace dxvk::hud {
     /**
      * \brief Renders the HUD
      *
-     * \param [in] renderer HUD renderer
+     * \param [in] ctx Raw context objects
+     * \param [in] options HUD options
+     * \param [in] renderer HUD renderer for text rendering
      * \param [in] position Base offset
      * \returns Base offset for next item
      */
     virtual HudPos render(
-            HudRenderer&      renderer,
-            HudPos            position) = 0;
+      const Rc<DxvkCommandList>&ctx,
+      const HudPipelineKey&     key,
+      const HudOptions&         options,
+            HudRenderer&        renderer,
+            HudPos              position) = 0;
 
   };
 
@@ -70,7 +77,18 @@ namespace dxvk::hud {
      * \returns Base offset for next item
      */
     void render(
-            HudRenderer&      renderer);
+      const Rc<DxvkCommandList>&ctx,
+      const HudPipelineKey&     key,
+      const HudOptions&         options,
+            HudRenderer&        renderer);
+
+    /**
+     * \brief Checks whether the item set is empty
+     * \returns \c true if there are no items
+     */
+    bool empty() const {
+      return m_items.empty();
+    }
 
     /**
      * \brief Creates a HUD item if enabled
@@ -81,7 +99,7 @@ namespace dxvk::hud {
      * \param [in] args Constructor arguments
      */
     template<typename T, typename... Args>
-    void add(const char* name, int32_t at, Args... args) {
+    Rc<T> add(const char* name, int32_t at, Args... args) {
       bool enable = m_enableFull;
 
       if (!enable) {
@@ -92,10 +110,14 @@ namespace dxvk::hud {
       if (at < 0 || at > int32_t(m_items.size()))
         at = m_items.size();
 
+      Rc<T> item;
+
       if (enable) {
-        m_items.insert(m_items.begin() + at,
-          new T(std::forward<Args>(args)...));
+        item = new T(std::forward<Args>(args)...);
+        m_items.insert(m_items.begin() + at, item);
       }
+
+      return item;
     }
 
     template<typename T>
@@ -129,8 +151,11 @@ namespace dxvk::hud {
   public:
 
     HudPos render(
-            HudRenderer&      renderer,
-            HudPos            position);
+      const Rc<DxvkCommandList>&ctx,
+      const HudPipelineKey&     key,
+      const HudOptions&         options,
+            HudRenderer&        renderer,
+            HudPos              position);
 
   };
 
@@ -147,12 +172,16 @@ namespace dxvk::hud {
     ~HudClientApiItem();
 
     HudPos render(
-            HudRenderer&      renderer,
-            HudPos            position);
+      const Rc<DxvkCommandList>&ctx,
+      const HudPipelineKey&     key,
+      const HudOptions&         options,
+            HudRenderer&        renderer,
+            HudPos              position);
 
   private:
 
-    std::string m_api;
+    sync::Spinlock  m_mutex;
+    std::string     m_api;
 
   };
 
@@ -169,8 +198,11 @@ namespace dxvk::hud {
     ~HudDeviceInfoItem();
 
     HudPos render(
-            HudRenderer&      renderer,
-            HudPos            position);
+      const Rc<DxvkCommandList>&ctx,
+      const HudPipelineKey&     key,
+      const HudOptions&         options,
+            HudRenderer&        renderer,
+            HudPos              position);
 
   private:
 
@@ -195,8 +227,11 @@ namespace dxvk::hud {
     void update(dxvk::high_resolution_clock::time_point time);
 
     HudPos render(
-            HudRenderer&      renderer,
-            HudPos            position);
+      const Rc<DxvkCommandList>&ctx,
+      const HudPipelineKey&     key,
+      const HudOptions&         options,
+            HudRenderer&        renderer,
+            HudPos              position);
 
   private:
 
@@ -213,26 +248,103 @@ namespace dxvk::hud {
    * \brief HUD item to display the frame rate
    */
   class HudFrameTimeItem : public HudItem {
-    constexpr static size_t NumDataPoints = 304;
+    constexpr static size_t NumDataPoints = 420u;
+    constexpr static size_t NumTextDraws = 2u;
   public:
 
-    HudFrameTimeItem();
+    HudFrameTimeItem(
+      const Rc<DxvkDevice>&     device,
+            HudRenderer*        renderer);
 
     ~HudFrameTimeItem();
 
-    void update(dxvk::high_resolution_clock::time_point time);
-
     HudPos render(
-            HudRenderer&      renderer,
-            HudPos            position);
+      const Rc<DxvkCommandList>&ctx,
+      const HudPipelineKey&     key,
+      const HudOptions&         options,
+            HudRenderer&        renderer,
+            HudPos              position);
 
   private:
 
-    dxvk::high_resolution_clock::time_point m_lastUpdate
-      = dxvk::high_resolution_clock::now();
+    struct ComputePushConstants {
+      float msPerTick;
+      uint32_t dataPoint;
+      int16_t textPosMinX;
+      int16_t textPosMinY;
+      int16_t textPosMaxX;
+      int16_t textPosMaxY;
+    };
 
-    std::array<float, NumDataPoints>  m_dataPoints  = {};
-    uint32_t                          m_dataPointId = 0;
+    struct RenderPushConstants {
+      HudPushConstants hud;
+      int16_t x;
+      int16_t y;
+      int16_t w;
+      int16_t h;
+      uint32_t frameIndex;
+    };
+
+    struct BufferLayout {
+      size_t timestampSize;
+      size_t drawInfoOffset;
+      size_t drawInfoSize;
+      size_t drawParamOffset;
+      size_t drawParamSize;
+      size_t textOffset;
+      size_t textSize;
+      size_t totalSize;
+    };
+
+    Rc<DxvkDevice>            m_device;
+    Rc<DxvkBuffer>            m_gpuBuffer;
+    Rc<DxvkBufferView>        m_textWrView;
+    Rc<DxvkBufferView>        m_textRdView;
+    Rc<DxvkGpuQuery>          m_query;
+
+    const DxvkPipelineLayout* m_computePipelineLayout = nullptr;
+    const DxvkPipelineLayout* m_gfxPipelineLayout     = nullptr;
+
+    VkPipeline                m_computePipeline = VK_NULL_HANDLE;
+
+    std::unordered_map<HudPipelineKey,
+      VkPipeline, DxvkHash, DxvkEq> m_gfxPipelines;
+
+    uint32_t                  m_nextDataPoint = 0u;
+
+    void processFrameTimes(
+      const Rc<DxvkCommandList>&ctx,
+      const HudPipelineKey&     key,
+            HudRenderer&        renderer,
+            uint32_t            dataPoint,
+            HudPos              minPos,
+            HudPos              maxPos);
+
+    void drawFrameTimeGraph(
+      const Rc<DxvkCommandList>&ctx,
+      const HudPipelineKey&     key,
+            HudRenderer&        renderer,
+            uint32_t            dataPoint,
+            HudPos              graphPos,
+            HudPos              graphSize);
+
+    void createResources(
+      const Rc<DxvkCommandList>&ctx);
+
+    void createComputePipeline(
+          HudRenderer&          renderer);
+
+    const DxvkPipelineLayout* createPipelineLayout();
+
+    VkPipeline getPipeline(
+            HudRenderer&        renderer,
+      const HudPipelineKey&     key);
+
+    VkPipeline createPipeline(
+            HudRenderer&        renderer,
+      const HudPipelineKey&     key);
+
+    static BufferLayout computeBufferLayout();
 
   };
 
@@ -251,8 +363,11 @@ namespace dxvk::hud {
     void update(dxvk::high_resolution_clock::time_point time);
 
     HudPos render(
-            HudRenderer&      renderer,
-            HudPos            position);
+      const Rc<DxvkCommandList>&ctx,
+      const HudPipelineKey&     key,
+      const HudOptions&         options,
+            HudRenderer&        renderer,
+            HudPos              position);
 
   private:
 
@@ -289,8 +404,11 @@ namespace dxvk::hud {
     void update(dxvk::high_resolution_clock::time_point time);
 
     HudPos render(
-            HudRenderer&      renderer,
-            HudPos            position);
+      const Rc<DxvkCommandList>&ctx,
+      const HudPipelineKey&     key,
+      const HudOptions&         options,
+            HudRenderer&        renderer,
+            HudPos              position);
 
   private:
 
@@ -298,10 +416,11 @@ namespace dxvk::hud {
 
     DxvkStatCounters  m_prevCounters;
 
-    uint64_t          m_gpCount = 0;
-    uint64_t          m_cpCount = 0;
-    uint64_t          m_rpCount = 0;
-    uint64_t          m_pbCount = 0;
+    uint64_t          m_drawCallCount   = 0;
+    uint64_t          m_drawCount       = 0;
+    uint64_t          m_dispatchCount   = 0;
+    uint64_t          m_renderPassCount = 0;
+    uint64_t          m_barrierCount    = 0;
 
     dxvk::high_resolution_clock::time_point m_lastUpdate
       = dxvk::high_resolution_clock::now();
@@ -323,8 +442,11 @@ namespace dxvk::hud {
     void update(dxvk::high_resolution_clock::time_point time);
 
     HudPos render(
-            HudRenderer&      renderer,
-            HudPos            position);
+      const Rc<DxvkCommandList>&ctx,
+      const HudPipelineKey&     key,
+      const HudOptions&         options,
+            HudRenderer&        renderer,
+            HudPos              position);
 
   private:
 
@@ -341,7 +463,7 @@ namespace dxvk::hud {
    * \brief HUD item to display descriptor stats
    */
   class HudDescriptorStatsItem : public HudItem {
-
+    constexpr static int64_t UpdateInterval = 500'000;
   public:
 
     HudDescriptorStatsItem(const Rc<DxvkDevice>& device);
@@ -351,8 +473,11 @@ namespace dxvk::hud {
     void update(dxvk::high_resolution_clock::time_point time);
 
     HudPos render(
-            HudRenderer&      renderer,
-            HudPos            position);
+      const Rc<DxvkCommandList>&ctx,
+      const HudPipelineKey&     key,
+      const HudOptions&         options,
+            HudRenderer&        renderer,
+            HudPos              position);
 
   private:
 
@@ -360,6 +485,17 @@ namespace dxvk::hud {
 
     uint64_t m_descriptorPoolCount = 0;
     uint64_t m_descriptorSetCount  = 0;
+
+    uint64_t m_descriptorHeapCount = 0;
+    uint64_t m_descriptorHeapAlloc = 0;
+    uint64_t m_descriptorHeapUsed  = 0;
+    uint64_t m_descriptorHeapMax   = 0;
+    uint64_t m_descriptorHeapPrev  = 0;
+
+    uint64_t m_copyThreadBusyTicks = 0;
+    uint32_t m_copyThreadLoad      = 0u;
+
+    high_resolution_clock::time_point m_lastUpdate = { };
 
   };
 
@@ -378,14 +514,102 @@ namespace dxvk::hud {
     void update(dxvk::high_resolution_clock::time_point time);
 
     HudPos render(
-            HudRenderer&      renderer,
-            HudPos            position);
+      const Rc<DxvkCommandList>&ctx,
+      const HudPipelineKey&     key,
+      const HudOptions&         options,
+            HudRenderer&        renderer,
+            HudPos              position);
 
   private:
 
     Rc<DxvkDevice>                    m_device;
     VkPhysicalDeviceMemoryProperties  m_memory;
     DxvkMemoryStats                   m_heaps[VK_MAX_MEMORY_HEAPS];
+
+  };
+
+
+  /**
+   * \brief HUD item to display detailed memory allocation info
+   */
+  class HudMemoryDetailsItem : public HudItem {
+    constexpr static int64_t UpdateInterval = 500'000;
+  public:
+
+    HudMemoryDetailsItem(
+      const Rc<DxvkDevice>&     device,
+            HudRenderer*        renderer);
+
+    ~HudMemoryDetailsItem();
+
+    void update(dxvk::high_resolution_clock::time_point time);
+
+    HudPos render(
+      const Rc<DxvkCommandList>&ctx,
+      const HudPipelineKey&     key,
+      const HudOptions&         options,
+            HudRenderer&        renderer,
+            HudPos              position);
+
+  private:
+
+    struct DrawInfo {
+      int16_t x;
+      int16_t y;
+      int16_t w;
+      int16_t h;
+      uint16_t pageMask;
+      uint16_t pageCountAndActiveBit;
+      uint32_t color;
+    };
+
+    struct PipelinePair {
+      VkPipeline background = VK_NULL_HANDLE;
+      VkPipeline visualize = VK_NULL_HANDLE;
+    };
+
+    Rc<DxvkDevice>                    m_device;
+    DxvkMemoryAllocationStats         m_stats;
+    DxvkSharedAllocationCacheStats    m_cacheStats;
+
+    high_resolution_clock::time_point m_lastUpdate = { };
+
+    bool                      m_displayCacheStats = false;
+
+    Rc<DxvkBuffer>            m_dataBuffer;
+    std::vector<DrawInfo>     m_drawInfos;
+
+    const DxvkPipelineLayout* m_pipelineLayout = nullptr;
+
+    std::unordered_map<HudPipelineKey,
+      PipelinePair, DxvkHash, DxvkEq> m_pipelines;
+
+    void drawChunk(
+            HudPos              pos,
+            HudPos              size,
+            uint32_t            color,
+      const DxvkMemoryChunkStats& chunk);
+
+    void flushDraws(
+      const Rc<DxvkCommandList>&ctx,
+      const HudPipelineKey&     key,
+      const HudOptions&         options,
+            HudRenderer&        renderer);
+
+    void updateDataBuffer(
+      const Rc<DxvkCommandList>&ctx,
+            DxvkResourceBufferInfo& drawDescriptor,
+            DxvkResourceBufferInfo& dataDescriptor);
+
+    const DxvkPipelineLayout* createPipelineLayout();
+
+    PipelinePair createPipeline(
+            HudRenderer&        renderer,
+      const HudPipelineKey&     key);
+
+    PipelinePair getPipeline(
+            HudRenderer&        renderer,
+      const HudPipelineKey&     key);
 
   };
 
@@ -404,8 +628,11 @@ namespace dxvk::hud {
     void update(dxvk::high_resolution_clock::time_point time);
 
     HudPos render(
-            HudRenderer&      renderer,
-            HudPos            position);
+      const Rc<DxvkCommandList>&ctx,
+      const HudPipelineKey&     key,
+      const HudOptions&         options,
+            HudRenderer&        renderer,
+            HudPos              position);
 
   private:
 
@@ -414,14 +641,18 @@ namespace dxvk::hud {
     uint64_t m_prevCsSyncCount  = 0;
     uint64_t m_prevCsSyncTicks  = 0;
     uint64_t m_prevCsChunks     = 0;
+    uint64_t m_prevCsIdleTicks = 0;
 
     uint64_t m_maxCsSyncCount   = 0;
     uint64_t m_maxCsSyncTicks   = 0;
+
+    uint64_t m_diffCsIdleTicks = 0;
 
     uint64_t m_updateCount      = 0;
 
     std::string m_csSyncString;
     std::string m_csChunkString;
+    std::string m_csLoadString;
 
     dxvk::high_resolution_clock::time_point m_lastUpdate
       = dxvk::high_resolution_clock::now();
@@ -443,8 +674,11 @@ namespace dxvk::hud {
     void update(dxvk::high_resolution_clock::time_point time);
 
     HudPos render(
-            HudRenderer&      renderer,
-            HudPos            position);
+      const Rc<DxvkCommandList>&ctx,
+      const HudPipelineKey&     key,
+      const HudOptions&         options,
+            HudRenderer&        renderer,
+            HudPos              position);
 
   private:
 
@@ -475,8 +709,11 @@ namespace dxvk::hud {
     void update(dxvk::high_resolution_clock::time_point time);
 
     HudPos render(
-            HudRenderer&      renderer,
-            HudPos            position);
+      const Rc<DxvkCommandList>&ctx,
+      const HudPipelineKey&     key,
+      const HudOptions&         options,
+            HudRenderer&        renderer,
+            HudPos              position);
 
   private:
 
@@ -493,6 +730,48 @@ namespace dxvk::hud {
     dxvk::high_resolution_clock::time_point m_timeDone = dxvk::high_resolution_clock::now();
 
     uint32_t computePercentage() const;
+
+  };
+
+
+  /**
+   * \brief Frame latency item
+   */
+  class HudLatencyItem : public HudItem {
+    constexpr static int64_t UpdateInterval = 500'000;
+
+    constexpr static uint32_t MaxInvalidUpdates = 20u;
+  public:
+
+    HudLatencyItem();
+
+    ~HudLatencyItem();
+
+    void accumulateStats(const DxvkLatencyStats& stats);
+
+    void update(dxvk::high_resolution_clock::time_point time);
+
+    HudPos render(
+      const Rc<DxvkCommandList>&ctx,
+      const HudPipelineKey&     key,
+      const HudOptions&         options,
+            HudRenderer&        renderer,
+            HudPos              position);
+
+  private:
+
+    sync::Spinlock      m_mutex;
+
+    DxvkLatencyStats    m_accumStats = { };
+    uint32_t            m_accumFrames = 0u;
+
+    uint32_t            m_invalidUpdates = MaxInvalidUpdates;
+
+    std::string         m_latencyString;
+    std::string         m_sleepString;
+
+    dxvk::high_resolution_clock::time_point m_lastUpdate
+      = dxvk::high_resolution_clock::now();
 
   };
 

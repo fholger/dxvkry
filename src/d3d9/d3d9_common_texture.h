@@ -48,6 +48,9 @@ namespace dxvk {
     bool                IsBackBuffer;
     bool                IsAttachmentOnly;
     bool                IsLockable;
+
+    // Additional parameters for ID3D9VkInteropDevice
+    VkImageUsageFlags   ImageUsage = 0;
   };
 
   struct D3D9ColorView {
@@ -61,6 +64,7 @@ namespace dxvk {
 
     Rc<DxvkImageView> Color;
     Rc<DxvkImageView> Srgb;
+    Rc<DxvkImageView> DepthReadOnly;
   };
 
   template <typename T>
@@ -71,6 +75,8 @@ namespace dxvk {
   class D3D9CommonTexture {
 
   public:
+
+    static constexpr UINT AllLayers = std::numeric_limits<uint32_t>::max();
 
     D3D9CommonTexture(
             D3D9DeviceEx*             pDevice,
@@ -198,6 +204,14 @@ namespace dxvk {
     }
 
     /**
+     * \brief Cube
+     * \returns Whether the texture is a cube map
+     */
+    bool IsCube() const {
+      return m_type == D3DRTYPE_CUBETEXTURE;
+    }
+
+    /**
      * \brief Dref Clamp
      * \returns Whether the texture emulates an UNORM format with D32f
      */
@@ -314,11 +328,13 @@ namespace dxvk {
       return std::exchange(m_transitionedToHazardLayout, true);
     }
 
-    D3DRESOURCETYPE GetType() {
+    D3DRESOURCETYPE GetType() const {
       return m_type;
     }
 
     uint32_t GetPlaneCount() const;
+
+    D3DPOOL GetPool() const { return m_desc.Pool; }
 
     const D3D9_VK_FORMAT_MAPPING& GetMapping() { return m_mapping; }
 
@@ -334,41 +350,19 @@ namespace dxvk {
 
     void MarkAllNeedReadback() { m_needsReadback.setAll(); }
 
-    void SetReadOnlyLocked(UINT Subresource, bool readOnly) { return m_readOnly.set(Subresource, readOnly); }
-
-    bool GetReadOnlyLocked(UINT Subresource) const { return m_readOnly.get(Subresource); }
-
     const Rc<DxvkImageView>& GetSampleView(bool srgb) const {
       return m_sampleView.Pick(srgb && IsSrgbCompatible());
     }
 
-    VkImageLayout DetermineRenderTargetLayout(VkImageLayout hazardLayout) const {
-      if (unlikely(m_transitionedToHazardLayout))
-        return hazardLayout;
-
-      return m_image != nullptr &&
-             m_image->info().tiling == VK_IMAGE_TILING_OPTIMAL
-        ? VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL
-        : VK_IMAGE_LAYOUT_GENERAL;
-    }
-
-    VkImageLayout DetermineDepthStencilLayout(bool write, bool hazardous, VkImageLayout hazardLayout) const {
-      if (unlikely(m_transitionedToHazardLayout))
-        return hazardLayout;
-
-      if (unlikely(m_image->info().tiling != VK_IMAGE_TILING_OPTIMAL))
-        return VK_IMAGE_LAYOUT_GENERAL;
-
-      if (unlikely(hazardous && !write))
-        return VK_IMAGE_LAYOUT_DEPTH_READ_ONLY_STENCIL_ATTACHMENT_OPTIMAL;
-
-      return VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
+    const Rc<DxvkImageView>& GetDepthReadOnlySampleView() const {
+      return m_sampleView.DepthReadOnly;
     }
 
     Rc<DxvkImageView> CreateView(
             UINT                   Layer,
             UINT                   Lod,
-            VkImageUsageFlags      UsageFlags,
+            VkImageUsageFlagBits   UsageFlags,
+            VkImageLayout          Layout,
             bool                   Srgb);
     D3D9SubresourceBitset& GetUploadBitmask() { return m_needsUpload; }
 
@@ -439,6 +433,10 @@ namespace dxvk {
 
     static VkImageType GetImageTypeFromResourceType(
             D3DRESOURCETYPE  Dimension);
+
+    static VkImageViewType GetImageViewTypeFromResourceType(
+            D3DRESOURCETYPE  Dimension,
+            UINT             Layer);
 
      /**
      * \brief Tracks sequence number for a given subresource
@@ -519,8 +517,6 @@ namespace dxvk {
 
     D3D9SubresourceBitset         m_locked = { };
 
-    D3D9SubresourceBitset         m_readOnly = { };
-
     D3D9SubresourceBitset         m_needsReadback = { };
 
     D3D9SubresourceBitset         m_needsUpload = { };
@@ -547,23 +543,12 @@ namespace dxvk {
       const DxvkImageCreateInfo*  pImageInfo,
             VkImageTiling         Tiling) const;
 
-    VkImageUsageFlags EnableMetaCopyUsage(
-            VkFormat              Format,
-            VkImageTiling         Tiling,
-            VkSampleCountFlags    SampleCount) const;
-
     D3D9_COMMON_TEXTURE_MAP_MODE DetermineMapMode() const;
 
     VkImageLayout OptimizeLayout(
             VkImageUsageFlags         Usage) const;
 
     void ExportImageInfo();
-
-    static VkImageViewType GetImageViewTypeFromResourceType(
-            D3DRESOURCETYPE  Dimension,
-            UINT             Layer);
-
-    static constexpr UINT AllLayers = UINT32_MAX;
 
   };
 

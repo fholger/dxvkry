@@ -16,13 +16,13 @@ namespace dxvk {
     for (uint32_t i = 0; i < MaxNumRenderTargets; i++) {
       if (m_renderTargets.color[i].view != nullptr) {
         m_attachments[m_attachmentCount++] = i;
-        m_sampleCount = m_renderTargets.color[i].view->imageInfo().sampleCount;
+        m_sampleCount = m_renderTargets.color[i].view->image()->info().sampleCount;
       }
     }
 
     if (m_renderTargets.depth.view != nullptr) {
       m_attachments[m_attachmentCount++] = -1;
-      m_sampleCount = m_renderTargets.depth.view->imageInfo().sampleCount;
+      m_sampleCount = m_renderTargets.depth.view->image()->info().sampleCount;
     }
   }
 
@@ -42,28 +42,23 @@ namespace dxvk {
   }
 
 
-  bool DxvkFramebufferInfo::hasTargets(const DxvkRenderTargets& renderTargets) {
-    bool eq = m_renderTargets.depth.view   == renderTargets.depth.view
-           && m_renderTargets.depth.layout == renderTargets.depth.layout;
-
-    for (uint32_t i = 0; i < MaxNumRenderTargets && eq; i++) {
-      eq &= m_renderTargets.color[i].view   == renderTargets.color[i].view
-         && m_renderTargets.color[i].layout == renderTargets.color[i].layout;
-    }
-
-    return eq;
-  }
-
-
   bool DxvkFramebufferInfo::isFullSize(const Rc<DxvkImageView>& view) const {
     return m_renderSize.width  == view->mipLevelExtent(0).width
         && m_renderSize.height == view->mipLevelExtent(0).height
-        && m_renderSize.layers == view->info().numLayers;
+        && m_renderSize.layers == view->info().layerCount;
   }
 
 
   bool DxvkFramebufferInfo::isWritable(uint32_t attachmentIndex, VkImageAspectFlags aspects) const {
-    VkImageAspectFlags writableAspects = vk::getWritableAspectsForLayout(getAttachment(attachmentIndex).layout);
+    const auto& attachment = getAttachment(attachmentIndex);
+
+    if (!attachment.view)
+      return false;
+
+    /* Check the layout that the view was created for, not the view that we
+     * actually selected for rendering since that may lose information about
+     * the writable aspects. */
+    VkImageAspectFlags writableAspects = vk::getWritableAspectsForLayout(attachment.view->info().layout);
     return (writableAspects & aspects) == aspects;
   }
 
@@ -72,10 +67,10 @@ namespace dxvk {
     VkFormat depthStencilFormat = VK_FORMAT_UNDEFINED;
     VkImageAspectFlags depthStencilReadOnlyAspects = 0;
 
-    if (m_renderTargets.depth.view != nullptr) {
+    if (m_renderTargets.depth.view) {
       depthStencilFormat = m_renderTargets.depth.view->info().format;
       depthStencilReadOnlyAspects = m_renderTargets.depth.view->formatInfo()->aspectMask
-        & ~vk::getWritableAspectsForLayout(m_renderTargets.depth.layout);
+        & ~vk::getWritableAspectsForLayout(m_renderTargets.depth.view->info().layout);
     }
 
     std::array<VkFormat, MaxNumRenderTargets> colorFormats = { };
@@ -118,7 +113,7 @@ namespace dxvk {
   DxvkFramebufferSize DxvkFramebufferInfo::computeRenderTargetSize(
     const Rc<DxvkImageView>& renderTarget) const {
     auto extent = renderTarget->mipLevelExtent(0);
-    auto layers = renderTarget->info().numLayers;
+    auto layers = renderTarget->info().layerCount;
     return DxvkFramebufferSize { extent.width, extent.height, layers };
   }
 

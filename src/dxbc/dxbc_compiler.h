@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <utility>
 #include <vector>
 
 #include "../spirv/spirv_module.h"
@@ -135,6 +136,13 @@ namespace dxvk {
     uint32_t    component = 0;
   };
   
+
+  struct DxbcIndexRange {
+    DxbcOperandType type;
+    uint32_t start;
+    uint32_t length;
+  };
+
   
   /**
    * \brief Vertex shader-specific structure
@@ -165,8 +173,8 @@ namespace dxvk {
 
     bool needsOutputSetup = false;
   };
-  
-  
+
+
   /**
    * \brief Pixel shader-specific structure
    */
@@ -183,8 +191,8 @@ namespace dxvk {
     uint32_t builtinLayer         = 0;
     uint32_t builtinViewportId    = 0;
     uint32_t builtinInnerCoverageId = 0;
-    
-    uint32_t pushConstantId       = 0;
+
+    uint32_t rasterizerPushIndex = 0u;
   };
   
   
@@ -396,6 +404,17 @@ namespace dxvk {
      * \returns The final shader object
      */
     Rc<DxvkShader> finalize();
+
+    /**
+     * \brief Extracts immediate constant buffer data
+     *
+     * Only defined if the ICB needs to be backed by a
+     * uniform buffer.
+     * \returns Immediate constant buffer data
+     */
+    std::vector<uint32_t> getIcbData() const {
+      return std::move(m_icbData);
+    }
     
   private:
     
@@ -445,6 +464,10 @@ namespace dxvk {
     // xfb output registers for geometry shaders
     std::vector<DxbcXfbVar> m_xfbVars;
     
+    /////////////////////////////////////////////
+    // Dynamically indexed input and output regs
+    std::vector<DxbcIndexRange> m_indexRanges = { };
+
     //////////////////////////////////////////////////////
     // Shader resource variables. These provide access to
     // constant buffers, samplers, textures, and UAVs.
@@ -453,6 +476,12 @@ namespace dxvk {
     std::array<DxbcShaderResource, 128> m_textures;
     std::array<DxbcUav,             64> m_uavs;
 
+    uint32_t m_pushDataId = 0u;
+    uint32_t m_samplerHeapId = 0u;
+
+    DxvkPushDataBlock m_sharedPushData;
+    DxvkPushDataBlock m_localPushData;
+
     bool m_hasGloballyCoherentUav = false;
     bool m_hasRasterizerOrderedUav = false;
 
@@ -460,7 +489,12 @@ namespace dxvk {
     // Control flow information. Stores labels for
     // currently active if-else blocks and loops.
     std::vector<DxbcCfgBlock> m_controlFlowBlocks;
-    
+
+    bool m_topLevelIsUniform = true;
+
+    uint64_t m_uavRdMask = 0u;
+    uint64_t m_uavWrMask = 0u;
+
     //////////////////////////////////////////////
     // Function state tracking. Required in order
     // to properly end functions in some cases.
@@ -473,7 +507,7 @@ namespace dxvk {
     uint32_t m_vArrayLengthId = 0;
 
     uint32_t m_vArray = 0;
-    
+
     ////////////////////////////////////////////////////
     // Per-vertex input and output blocks. Depending on
     // the shader stage, these may be declared as arrays.
@@ -486,13 +520,14 @@ namespace dxvk {
     uint32_t m_primitiveIdIn  = 0;
     uint32_t m_primitiveIdOut = 0;
 
-    uint32_t m_pointSizeOut   = 0;
-
     //////////////////////////////////////////////////
     // Immediate constant buffer. If defined, this is
     // an array of four-component uint32 vectors.
-    uint32_t m_immConstBuf = 0;
-    std::vector<char> m_immConstData;
+    uint32_t          m_icbArray = 0;
+    std::vector<uint32_t> m_icbData;
+
+    uint32_t          m_icbComponents = 0u;
+    uint32_t          m_icbSize = 0u;
     
     ///////////////////////////////////////////////////
     // Sample pos array. If defined, this iis an array
@@ -503,6 +538,7 @@ namespace dxvk {
     // Struct type used for UAV counter buffers
     uint32_t m_uavCtrStructType  = 0;
     uint32_t m_uavCtrPointerType = 0;
+    uint32_t m_uavCtrBdaType = 0;
     
     ////////////////////////////////
     // Function IDs for subroutines
@@ -536,6 +572,7 @@ namespace dxvk {
     DxbcOpcode m_lastOp = DxbcOpcode::Nop;
     DxbcOpcode m_currOp = DxbcOpcode::Nop;
 
+    VkPrimitiveTopology m_inputTopology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
     VkPrimitiveTopology m_outputTopology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
 
     /////////////////////////////////////////////////////
@@ -546,6 +583,9 @@ namespace dxvk {
     void emitDclGlobalFlags(
       const DxbcShaderInstruction&  ins);
     
+    void emitDclIndexRange(
+      const DxbcShaderInstruction&  ins);
+
     void emitDclTemps(
       const DxbcShaderInstruction&  ins);
     
@@ -575,6 +615,7 @@ namespace dxvk {
     void emitDclConstantBufferVar(
             uint32_t                regIdx,
             uint32_t                numConstants,
+            uint32_t                numComponents,
       const char*                   name);
     
     void emitDclSampler(
@@ -635,11 +676,13 @@ namespace dxvk {
     
     void emitDclImmediateConstantBufferBaked(
             uint32_t                dwordCount,
-      const uint32_t*               dwordArray);
+      const uint32_t*               dwordArray,
+            uint32_t                componentCount);
     
     void emitDclImmediateConstantBufferUbo(
             uint32_t                dwordCount,
-      const uint32_t*               dwordArray);
+      const uint32_t*               dwordArray,
+            uint32_t                componentCount);
     
     void emitCustomData(
       const DxbcShaderInstruction&  ins);
@@ -1017,8 +1060,6 @@ namespace dxvk {
     void emitOutputSetup();
     void emitOutputDepthClamp();
     
-    void emitInitWorkgroupMemory();
-
     //////////////////////////////////////////
     // System value load methods (per shader)
     DxbcRegisterValue emitVsSystemValueLoad(
@@ -1174,7 +1215,15 @@ namespace dxvk {
     uint32_t emitBuiltinTessLevelInner(
             spv::StorageClass storageClass);
 
-    uint32_t emitPushConstants();
+    void emitUavCounterTypes();
+
+    void emitUavCounterBindings();
+
+    void emitSamplerArray();
+
+    void emitPushSampler(uint32_t samplerIndex, uint32_t baseMember, uint32_t offset);
+
+    void emitPushData();
 
     ////////////////
     // Misc methods
@@ -1224,6 +1273,12 @@ namespace dxvk {
     
     bool ignoreInputSystemValue(
             DxbcSystemValue         sv) const;
+
+    void emitUavBarrier(
+            uint64_t                readMask,
+            uint64_t                writeMask);
+
+    DxvkShaderBinding nextBindingId() const;
 
     ///////////////////////////
     // Type definition methods

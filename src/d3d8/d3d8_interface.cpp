@@ -5,15 +5,16 @@
 
 #include <cstring>
 
-namespace dxvk
-{
-  D3D8Interface::D3D8Interface() {
-    m_d3d9 = d3d9::Direct3DCreate9(D3D_SDK_VERSION);
+namespace dxvk {
 
+  D3D8Interface::D3D8Interface()
+    : m_d3d9(d3d9::Direct3DCreate9(D3D_SDK_VERSION)) {
     // Get the bridge interface to D3D9.
-    if (FAILED(m_d3d9->QueryInterface(__uuidof(IDxvkD3D8InterfaceBridge), (void**)&m_bridge))) {
-      throw DxvkError("D3D8Device: ERROR! Failed to get D3D9 Bridge. d3d9.dll might not be DXVK!");
+    if (FAILED(m_d3d9->QueryInterface(__uuidof(IDxvkD3D8InterfaceBridge), reinterpret_cast<void**>(&m_bridge)))) {
+      throw DxvkError("D3D8Interface: ERROR! Failed to get D3D9 Bridge. d3d9.dll might not be DXVK!");
     }
+
+    m_bridge->EnableD3D8CompatibilityMode();
 
     m_d3d8Options = D3D8Options(*m_bridge->GetConfig());
 
@@ -87,7 +88,7 @@ namespace dxvk
 
       pIdentifier->WHQLLevel = identifier9.WHQLLevel;
     }
-    
+
     return res;
   }
 
@@ -118,6 +119,19 @@ namespace dxvk
 
     if (unlikely(pPresentationParameters == nullptr ||
                  ppReturnedDeviceInterface == nullptr))
+      return D3DERR_INVALIDCALL;
+
+    // D3DSWAPEFFECT_COPY can not be used with more than one back buffer.
+    // This is also technically true for D3DSWAPEFFECT_COPY_VSYNC, however
+    // RC Cars depends on it not being rejected.
+    if (unlikely(pPresentationParameters->SwapEffect == D3DSWAPEFFECT_COPY
+              && pPresentationParameters->BackBufferCount > 1))
+      return D3DERR_INVALIDCALL;
+
+    // In D3D8 nothing except D3DPRESENT_INTERVAL_DEFAULT can be used
+    // as a flag for windowed presentation.
+    if (unlikely(pPresentationParameters->Windowed
+              && pPresentationParameters->FullScreen_PresentationInterval != D3DPRESENT_INTERVAL_DEFAULT))
       return D3DERR_INVALIDCALL;
 
     Com<d3d9::IDirect3DDevice9> pDevice9 = nullptr;

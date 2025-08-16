@@ -48,6 +48,12 @@ namespace dxvk::wsi {
 
       if (pMode->dmFields & DM_DISPLAYFREQUENCY)
         eq &= curMode.dmDisplayFrequency == pMode->dmDisplayFrequency;
+      if (pMode->dmFields & DM_DISPLAYFLAGS)
+        eq &= curMode.dmDisplayFlags == pMode->dmDisplayFlags;
+      if (pMode->dmFields & DM_DISPLAYORIENTATION)
+        eq &= curMode.dmDisplayOrientation == pMode->dmDisplayOrientation;
+      if (pMode->dmFields & DM_POSITION)
+        eq &= curMode.dmPosition.x == pMode->dmPosition.x && curMode.dmPosition.y == pMode->dmPosition.y;
 
       if (eq)
         return true;
@@ -134,6 +140,7 @@ namespace dxvk::wsi {
   bool Win32WsiDriver::setWindowMode(
           HMONITOR                hMonitor,
           HWND                    hWindow,
+          DxvkWindowState*        pState,
     const WsiMode&                mode) {
     ::MONITORINFOEXW monInfo;
     monInfo.cbSize = sizeof(monInfo);
@@ -193,6 +200,7 @@ namespace dxvk::wsi {
       rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
       SWP_FRAMECHANGED | SWP_SHOWWINDOW | SWP_NOACTIVATE);
 
+    m_lastForegroundTimestamp = 0;
     return true;
   }
 
@@ -260,7 +268,12 @@ namespace dxvk::wsi {
 
 
   bool Win32WsiDriver::isOccluded(HWND hWindow) {
-    return ::GetForegroundWindow() != hWindow;
+    if (::GetForegroundWindow() == hWindow)
+    {
+      m_lastForegroundTimestamp = GetTickCount64();
+      return false;
+    }
+    return m_lastForegroundTimestamp && GetTickCount64() - m_lastForegroundTimestamp > 100;
   }
 
 

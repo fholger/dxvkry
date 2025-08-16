@@ -46,52 +46,42 @@ namespace dxvk {
   DxvkShader::DxvkShader(
     const DxvkShaderCreateInfo&   info,
           SpirvCodeBuffer&&       spirv)
-  : m_info(info), m_code(spirv), m_bindings(info.stage) {
-    m_info.uniformData = nullptr;
+  : m_info(info), m_code(spirv), m_layout(info.stage) {
     m_info.bindings = nullptr;
 
     // Copy resource binding slot infos
     for (uint32_t i = 0; i < info.bindingCount; i++) {
-      DxvkBindingInfo binding = info.bindings[i];
-      binding.stage = info.stage;
-      m_bindings.addBinding(binding);
-    }
-
-    if (info.pushConstSize) {
-      VkPushConstantRange pushConst;
-      pushConst.stageFlags = info.pushConstStages;
-      pushConst.offset = 0;
-      pushConst.size = info.pushConstSize;
-
-      m_bindings.addPushConstantRange(pushConst);
-    }
-
-    // Copy uniform buffer data
-    if (info.uniformSize) {
-      m_uniformData.resize(info.uniformSize);
-      std::memcpy(m_uniformData.data(), info.uniformData, info.uniformSize);
-      m_info.uniformData = m_uniformData.data();
+      DxvkShaderDescriptor descriptor(info.bindings[i], info.stage);
+      m_layout.addBindings(1, &descriptor);
     }
 
     // Run an analysis pass over the SPIR-V code to gather some
     // info that we may need during pipeline compilation.
-    bool usesPushConstants = false;
+    uint32_t pushConstantStructId = 0u;
 
     std::vector<BindingOffsets> bindingOffsets;
     std::vector<uint32_t> varIds;
     std::vector<uint32_t> sampleMaskIds;
+    std::unordered_map<uint32_t, uint32_t> pushConstantTypes;
 
     SpirvCodeBuffer code = std::move(spirv);
     uint32_t o1VarId = 0;
-    
+
     for (auto ins : code) {
       if (ins.opCode() == spv::OpDecorate) {
         if (ins.arg(2) == spv::DecorationBinding) {
           uint32_t varId = ins.arg(1);
           bindingOffsets.resize(std::max(bindingOffsets.size(), size_t(varId + 1)));
-          bindingOffsets[varId].bindingId = ins.arg(3);
+          bindingOffsets[varId].bindingIndex = ins.arg(3);
           bindingOffsets[varId].bindingOffset = ins.offset() + 3;
           varIds.push_back(varId);
+        }
+
+        if (ins.arg(2) == spv::DecorationDescriptorSet) {
+          uint32_t varId = ins.arg(1);
+          bindingOffsets.resize(std::max(bindingOffsets.size(), size_t(varId + 1)));
+          bindingOffsets[varId].setIndex = ins.arg(3);
+          bindingOffsets[varId].setOffset = ins.offset() + 3;
         }
 
         if (ins.arg(2) == spv::DecorationBuiltIn) {
@@ -99,12 +89,6 @@ namespace dxvk {
             sampleMaskIds.push_back(ins.arg(1));
           if (ins.arg(3) == spv::BuiltInPosition)
             m_flags.set(DxvkShaderFlag::ExportsPosition);
-        }
-
-        if (ins.arg(2) == spv::DecorationDescriptorSet) {
-          uint32_t varId = ins.arg(1);
-          bindingOffsets.resize(std::max(bindingOffsets.size(), size_t(varId + 1)));
-          bindingOffsets[varId].setOffset = ins.offset() + 3;
         }
 
         if (ins.arg(2) == spv::DecorationSpecId) {
@@ -134,6 +118,9 @@ namespace dxvk {
 
         if (ins.arg(2) == spv::ExecutionModeXfb)
           m_flags.set(DxvkShaderFlag::HasTransformFeedback);
+
+        if (ins.arg(2) == spv::ExecutionModePointMode)
+          m_flags.set(DxvkShaderFlag::TessellationPoints);
       }
 
       if (ins.opCode() == spv::OpCapability) {
@@ -157,12 +144,35 @@ namespace dxvk {
             m_flags.set(DxvkShaderFlag::ExportsSampleMask);
         }
 
-        if (ins.arg(3) == spv::StorageClassPushConstant)
-          usesPushConstants = true;
+        if (ins.arg(3) == spv::StorageClassPushConstant) {
+          auto type = pushConstantTypes.find(ins.arg(1));
+
+          if (type != pushConstantTypes.end())
+            pushConstantStructId = type->second;
+        }
+      }
+
+      if (ins.opCode() == spv::OpTypePointer) {
+        if (ins.arg(2) == spv::StorageClassPushConstant)
+          pushConstantTypes.insert({ ins.arg(1), ins.arg(3) });
       }
 
       // Ignore the actual shader code, there's nothing interesting for us in there.
       if (ins.opCode() == spv::OpFunction)
+        break;
+    }
+
+    for (auto ins : code) {
+      if (ins.opCode() == spv::OpMemberDecorate
+       && ins.arg(1) == pushConstantStructId
+       && ins.arg(3) == spv::DecorationOffset) {
+        auto& e = m_pushDataOffsets.emplace_back();
+        e.codeOffset = ins.offset() + 4;
+        e.pushOffset = ins.arg(4);
+      }
+
+      // Can exit even earlier here since decorations come up early
+      if (ins.opCode() == spv::OpFunction || ins.opCode() == spv::OpTypeVoid)
         break;
     }
 
@@ -174,10 +184,32 @@ namespace dxvk {
         m_bindingOffsets.push_back(info);
     }
 
-    // Set flag for stages that actually use push constants
-    // so that they can be trimmed for optimized pipelines.
-    if (usesPushConstants)
-      m_bindings.addPushConstantStage(info.stage);
+    if (pushConstantStructId) {
+      if (!info.sharedPushData.isEmpty()) {
+        auto stageMask = (info.stage & VK_SHADER_STAGE_ALL_GRAPHICS)
+          ? VK_SHADER_STAGE_ALL_GRAPHICS : VK_SHADER_STAGE_COMPUTE_BIT;
+
+        m_layout.addPushData(DxvkPushDataBlock(stageMask,
+          info.sharedPushData.getOffset(),
+          info.sharedPushData.getSize(),
+          info.sharedPushData.getAlignment(),
+          info.sharedPushData.getResourceDwordMask()));
+      }
+
+      if (!info.localPushData.isEmpty()) {
+        m_layout.addPushData(DxvkPushDataBlock(info.stage,
+          info.localPushData.getOffset(),
+          info.localPushData.getSize(),
+          info.localPushData.getAlignment(),
+          info.localPushData.getResourceDwordMask()));
+      }
+    }
+
+    if (info.samplerHeap.getStageMask() & info.stage) {
+      m_layout.addSamplerHeap(DxvkShaderBinding(info.stage,
+        info.samplerHeap.getSet(),
+        info.samplerHeap.getBinding()));
+    }
 
     // Don't set pipeline library flag if the shader
     // doesn't actually support pipeline libraries
@@ -191,20 +223,30 @@ namespace dxvk {
   
   
   SpirvCodeBuffer DxvkShader::getCode(
-    const DxvkBindingLayoutObjects*   layout,
+    const DxvkShaderBindingMap*       bindings,
     const DxvkShaderModuleCreateInfo& state) const {
     SpirvCodeBuffer spirvCode = m_code.decompress();
     uint32_t* code = spirvCode.data();
     
     // Remap resource binding IDs
-    for (const auto& info : m_bindingOffsets) {
-      auto mappedBinding = layout->lookupBinding(m_info.stage, info.bindingId);
+    if (bindings) {
+      for (const auto& info : m_bindingOffsets) {
+        auto mappedBinding = bindings->mapBinding(DxvkShaderBinding(
+          m_info.stage, info.setIndex, info.bindingIndex));
 
-      if (mappedBinding) {
-        code[info.bindingOffset] = mappedBinding->binding;
+        if (mappedBinding) {
+          code[info.bindingOffset] = mappedBinding->getBinding();
 
-        if (info.setOffset)
-          code[info.setOffset] = mappedBinding->set;
+          if (info.setOffset)
+            code[info.setOffset] = mappedBinding->getSet();
+        }
+      }
+
+      for (const auto& info : m_pushDataOffsets) {
+        uint32_t offset = bindings->mapPushData(m_info.stage, info.pushOffset);
+
+        if (offset < MaxTotalPushDataSize)
+          code[info.codeOffset] = offset;
       }
     }
 
@@ -216,6 +258,12 @@ namespace dxvk {
     // Replace undefined input variables with zero
     for (uint32_t u : bit::BitMask(state.undefinedInputs))
       eliminateInput(spirvCode, u);
+
+    // Patch primitive topology as necessary
+    if (m_info.stage == VK_SHADER_STAGE_GEOMETRY_BIT
+     && state.inputTopology != m_info.inputTopology
+     && state.inputTopology != VK_PRIMITIVE_TOPOLOGY_MAX_ENUM)
+      patchInputTopology(spirvCode, state.inputTopology);
 
     // Emit fragment shader swizzles as necessary
     if (m_info.stage == VK_SHADER_STAGE_FRAGMENT_BIT)
@@ -483,7 +531,7 @@ namespace dxvk {
       }
     }
   }
-  
+
 
   void DxvkShader::emitOutputSwizzles(
           SpirvCodeBuffer&          code,
@@ -836,6 +884,306 @@ namespace dxvk {
   }
 
 
+  void DxvkShader::patchInputTopology(SpirvCodeBuffer& code, VkPrimitiveTopology topology) {
+    struct TopologyInfo {
+      VkPrimitiveTopology topology;
+      spv::ExecutionMode  mode;
+      uint32_t            vertexCount;
+    };
+
+    static const std::array<TopologyInfo, 5> s_topologies = {{
+      { VK_PRIMITIVE_TOPOLOGY_POINT_LIST,                   spv::ExecutionModeInputPoints,              1u },
+      { VK_PRIMITIVE_TOPOLOGY_LINE_LIST,                    spv::ExecutionModeInputLines,               2u },
+      { VK_PRIMITIVE_TOPOLOGY_LINE_LIST_WITH_ADJACENCY,     spv::ExecutionModeInputLinesAdjacency,      4u },
+      { VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST,                spv::ExecutionModeTriangles,                3u },
+      { VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST_WITH_ADJACENCY, spv::ExecutionModeInputTrianglesAdjacency,  6u },
+    }};
+
+    const TopologyInfo* topologyInfo = nullptr;
+
+    for (const auto& top : s_topologies) {
+      if (top.topology == topology) {
+        topologyInfo = &top;
+        break;
+      }
+    }
+
+    if (!topologyInfo)
+      return;
+
+    uint32_t typeUint32Id = 0u;
+    uint32_t typeSint32Id = 0u;
+
+    struct ConstantInfo {
+      uint32_t typeId;
+      uint32_t value;
+    };
+
+    struct ArrayTypeInfo {
+      uint32_t arrayLengthId;
+      uint32_t scalarTypeId;
+      uint32_t replaceTypeId;
+    };
+
+    struct PointerTypeInfo {
+      uint32_t objectTypeId;
+    };
+
+    std::unordered_map<uint32_t, uint32_t> nullConstantsByType;
+    std::unordered_map<uint32_t, ConstantInfo> constants;
+    std::unordered_map<uint32_t, uint32_t> uintConstantValueToId;
+    std::unordered_map<uint32_t, ArrayTypeInfo> arrayTypes;
+    std::unordered_map<uint32_t, PointerTypeInfo> pointerTypes;
+    std::unordered_map<uint32_t, uint32_t> variableTypes;
+    std::unordered_set<uint32_t> nullAccessChains;
+    std::unordered_map<uint32_t, uint32_t> nullVarsByType;
+    std::vector<std::pair<uint32_t, uint32_t>> newNullVars;
+
+    uint32_t functionOffset = 0u;
+
+    for (auto iter = code.begin(); iter != code.end(); ) {
+      auto ins = *iter;
+
+      switch (ins.opCode()) {
+        case spv::OpExecutionMode: {
+          bool isTopology = false;
+
+          for (const auto& top : s_topologies)
+            isTopology |= spv::ExecutionMode(ins.arg(2)) == top.mode;
+
+          if (isTopology)
+            ins.setArg(2, uint32_t(topologyInfo->mode));
+        } break;
+
+        case spv::OpConstant: {
+          if (ins.arg(1) == typeUint32Id || ins.arg(1) == typeSint32Id) {
+            ConstantInfo c = { };
+            c.typeId = ins.arg(1);
+            c.value = ins.arg(3);
+
+            constants.insert({ ins.arg(2), c });
+            uintConstantValueToId.insert({ ins.arg(3), ins.arg(2) });
+          }
+        } break;
+
+        case spv::OpConstantNull: {
+          nullConstantsByType.insert({ ins.arg(1), ins.arg(2) });
+        } break;
+
+        case spv::OpTypeInt: {
+          if (ins.arg(2u) == 32u) {
+            if (ins.arg(3u))
+              typeSint32Id = ins.arg(1u);
+            else
+              typeUint32Id = ins.arg(1u);
+          }
+        } break;
+
+        case spv::OpTypeArray: {
+          ArrayTypeInfo t = { };
+          t.arrayLengthId = ins.arg(3);
+          t.scalarTypeId = ins.arg(2);
+          t.replaceTypeId = 0u;
+
+          arrayTypes.insert({ ins.arg(1), t });
+        } break;
+
+        case spv::OpTypePointer: {
+          // We know that all input arrays use the vertex count as their outer
+          // array size, so it is safe for us to simply replace the array type
+          // of any pointer type declaration with an appropriately sized array.
+          auto storageClass = spv::StorageClass(ins.arg(2));
+
+          if (storageClass == spv::StorageClassInput) {
+            uint32_t len = ins.length();
+
+            uint32_t arrayTypeId = 0u;
+            uint32_t scalarTypeId = 0u;
+
+            PointerTypeInfo t = { };
+            t.objectTypeId = ins.arg(3);
+
+            auto entry = arrayTypes.find(t.objectTypeId);
+
+            if (entry != arrayTypes.end()) {
+              if (!entry->second.replaceTypeId) {
+                arrayTypeId = code.allocId();
+                scalarTypeId = entry->second.scalarTypeId;
+
+                entry->second.replaceTypeId = arrayTypeId;
+              }
+
+              t.objectTypeId = entry->second.replaceTypeId;
+              ins.setArg(3, t.objectTypeId);
+            }
+
+            pointerTypes.insert({ ins.arg(1), t });
+
+            // If we replaced the array type, emit it before the pointer type
+            // decoration as necessary. It is legal to delcare identical array
+            // types multiple times.
+            if (arrayTypeId) {
+              code.beginInsertion(ins.offset());
+
+              auto lengthId = uintConstantValueToId.find(topologyInfo->vertexCount);
+
+              if (lengthId == uintConstantValueToId.end()) {
+                if (!typeUint32Id) {
+                  typeUint32Id = code.allocId();
+
+                  code.putIns  (spv::OpTypeInt, 4);
+                  code.putWord (typeUint32Id);
+                  code.putWord (32);
+                  code.putWord (0);
+                }
+
+                ConstantInfo c;
+                c.typeId = typeUint32Id;
+                c.value = topologyInfo->vertexCount;
+
+                uint32_t arrayLengthId = code.allocId();
+
+                code.putIns  (spv::OpConstant, 4);
+                code.putWord (c.typeId);
+                code.putWord (arrayLengthId);
+                code.putWord (c.value);
+
+                lengthId = uintConstantValueToId.insert({ c.value, arrayLengthId }).first;
+                constants.insert({ arrayLengthId, c });
+              }
+
+              ArrayTypeInfo t = { };
+              t.scalarTypeId = scalarTypeId;
+              t.arrayLengthId = lengthId->second;
+
+              arrayTypes.insert({ arrayTypeId, t });
+
+              code.putIns   (spv::OpTypeArray, 4);
+              code.putWord  (arrayTypeId);
+              code.putWord  (t.scalarTypeId);
+              code.putWord  (t.arrayLengthId);
+
+              iter = SpirvInstructionIterator(code.data(), code.endInsertion() + len, code.dwords());
+              continue;
+            }
+          }
+        } break;
+
+        case spv::OpVariable: {
+          auto storageClass = spv::StorageClass(ins.arg(3));
+
+          if (storageClass == spv::StorageClassInput)
+            variableTypes.insert({ ins.arg(2), ins.arg(1) });
+        } break;
+
+        case spv::OpFunction: {
+          if (!functionOffset)
+            functionOffset = ins.offset();
+        } break;
+
+        case spv::OpAccessChain:
+        case spv::OpInBoundsAccessChain: {
+          bool nullChain = false;
+          auto var = variableTypes.find(ins.arg(3));
+
+          if (var == variableTypes.end()) {
+            // If we're recursively loading from a null access chain, skip
+            auto chain = nullAccessChains.find(ins.arg(3));
+            nullChain = chain != nullAccessChains.end();
+          } else {
+            // If the index is out of bounds, mark the access chain as
+            // dead so we can replace all loads with a null constant.
+            auto c = constants.find(ins.arg(4u));
+
+            if (c == constants.end())
+              break;
+
+            nullChain = c->second.value >= topologyInfo->vertexCount;
+          }
+
+          if (nullChain) {
+            nullAccessChains.insert(ins.arg(2));
+
+            code.beginInsertion(ins.offset());
+            code.erase(ins.length());
+
+            iter = SpirvInstructionIterator(code.data(), code.endInsertion(), code.dwords());
+            continue;
+          }
+        } break;
+
+        case spv::OpLoad: {
+          // If we're loading from a null access chain, replace with null constant load.
+          // We should never load the entire array at once, so ignore that case.
+          if (nullAccessChains.find(ins.arg(3)) != nullAccessChains.end()) {
+            auto var = nullVarsByType.find(ins.arg(1));
+
+            if (var == nullVarsByType.end()) {
+              var = nullVarsByType.insert({ ins.arg(1), code.allocId() }).first;
+              newNullVars.push_back(std::make_pair(var->second, ins.arg(1)));
+            }
+
+            ins.setArg(3, var->second);
+          }
+        } break;
+
+        default:;
+      }
+
+      iter++;
+    }
+
+    // Insert new null variables
+    code.beginInsertion(functionOffset);
+
+    for (auto v : newNullVars) {
+      auto nullConst = nullConstantsByType.find(v.second);
+
+      if (nullConst == nullConstantsByType.end()) {
+        uint32_t nullConstId = code.allocId();
+
+        code.putIns   (spv::OpConstantNull, 3u);
+        code.putWord  (v.second);
+        code.putWord  (nullConstId);
+
+        nullConst = nullConstantsByType.insert({ v.second, nullConstId }).first;
+      }
+
+      uint32_t pointerTypeId = code.allocId();
+
+      code.putIns   (spv::OpTypePointer, 4u);
+      code.putWord  (pointerTypeId);
+      code.putWord  (spv::StorageClassPrivate);
+      code.putWord  (v.second);
+
+      code.putIns   (spv::OpVariable, 5u);
+      code.putWord  (pointerTypeId);
+      code.putWord  (v.first);
+      code.putWord  (spv::StorageClassPrivate);
+      code.putWord  (nullConst->second);
+    }
+
+    code.endInsertion();
+
+    // Add newly declared null variables to entry point
+    for (auto ins : code) {
+      if (ins.opCode() == spv::OpEntryPoint) {
+        uint32_t len = ins.length();
+        uint32_t token = ins.opCode() | ((len + newNullVars.size()) << 16);
+        ins.setArg(0, token);
+
+        code.beginInsertion(ins.offset() + len);
+
+        for (auto v : newNullVars)
+          code.putWord(v.first);
+
+        code.endInsertion();
+        break;
+      }
+    }
+  }
+
+
   DxvkShaderStageInfo::DxvkShaderStageInfo(const DxvkDevice* device)
   : m_device(device) {
 
@@ -849,31 +1197,14 @@ namespace dxvk {
     auto& codeBuffer = m_codeBuffers[m_stageCount];
     codeBuffer = std::move(code);
 
-    // For graphics pipelines, as long as graphics pipeline libraries are
-    // enabled, we do not need to create a shader module object and can
-    // instead chain the create info to the shader stage info struct.
     auto& moduleInfo = m_moduleInfos[m_stageCount].moduleInfo;
     moduleInfo = { VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO };
     moduleInfo.codeSize = codeBuffer.size();
     moduleInfo.pCode = codeBuffer.data();
 
-    VkShaderModule shaderModule = VK_NULL_HANDLE;
-    if (!m_device->features().extGraphicsPipelineLibrary.graphicsPipelineLibrary) {
-      auto vk = m_device->vkd();
-
-      if (vk->vkCreateShaderModule(vk->device(), &moduleInfo, nullptr, &shaderModule))
-        throw DxvkError("DxvkShaderStageInfo: Failed to create shader module");
-    }
-
-    // Set up shader stage info with the data provided
     auto& stageInfo = m_stageInfos[m_stageCount];
-    stageInfo = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO };
-
-    if (!stageInfo.module)
-      stageInfo.pNext = &moduleInfo;
-
+    stageInfo = { VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, &moduleInfo };
     stageInfo.stage = stage;
-    stageInfo.module = shaderModule;
     stageInfo.pName = "main";
     stageInfo.pSpecializationInfo = specInfo;
 
@@ -907,12 +1238,7 @@ namespace dxvk {
 
 
   DxvkShaderStageInfo::~DxvkShaderStageInfo() {
-    auto vk = m_device->vkd();
 
-    for (uint32_t i = 0; i < m_stageCount; i++) {
-      if (m_stageInfos[i].module)
-        vk->vkDestroyShaderModule(vk->device(), m_stageInfos[i].module, nullptr);
-    }
   }
 
 
@@ -947,13 +1273,19 @@ namespace dxvk {
   }
 
 
-  DxvkBindingLayout DxvkShaderPipelineLibraryKey::getBindings() const {
-    DxvkBindingLayout mergedLayout(m_shaderStages);
+  DxvkPipelineLayoutBuilder DxvkShaderPipelineLibraryKey::getLayout() const {
+    // If no shader is defined, this is a null fragment shader library
+    VkShaderStageFlags stages = m_shaderStages;
 
-    for (uint32_t i = 0; i < m_shaderCount; i++)
-      mergedLayout.merge(m_shaders[i]->getBindings());
+    if (!stages)
+      stages = VK_SHADER_STAGE_FRAGMENT_BIT;
 
-    return mergedLayout;
+    DxvkPipelineLayoutBuilder result(stages);
+
+    for (uint32_t i = 0u; i < m_shaderCount; i++)
+      result.addLayout(m_shaders[i]->getLayout());
+
+    return result;
   }
 
 
@@ -1009,14 +1341,13 @@ namespace dxvk {
 
 
   DxvkShaderPipelineLibrary::DxvkShaderPipelineLibrary(
-    const DxvkDevice*               device,
+          DxvkDevice*               device,
           DxvkPipelineManager*      manager,
-    const DxvkShaderPipelineLibraryKey& key,
-    const DxvkBindingLayoutObjects* layout)
+    const DxvkShaderPipelineLibraryKey& key)
   : m_device      (device),
     m_stats       (&manager->m_stats),
     m_shaders     (key.getShaderSet()),
-    m_layout      (layout) {
+    m_layout      (device, manager, key.getLayout()) {
 
   }
 
@@ -1109,7 +1440,7 @@ namespace dxvk {
     DxvkShaderPipelineLibraryHandle pipeline = { VK_NULL_HANDLE, 0 };
 
     if (m_compiledOnce && canUsePipelineCacheControl())
-      pipeline = this->compileShaderPipeline(VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT);
+      pipeline = this->compileShaderPipeline(VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT);
 
     if (!pipeline.handle)
       pipeline = this->compileShaderPipeline(0);
@@ -1134,7 +1465,7 @@ namespace dxvk {
 
 
   DxvkShaderPipelineLibraryHandle DxvkShaderPipelineLibrary::compileShaderPipeline(
-          VkPipelineCreateFlags                 flags) {
+          VkPipelineCreateFlags2                flags) {
     DxvkShaderStageInfo stageInfo(m_device);
     VkShaderStageFlags stageMask = getShaderStages();
 
@@ -1145,7 +1476,7 @@ namespace dxvk {
         auto stage = VkShaderStageFlagBits(stages & -stages);
         auto identifier = getShaderIdentifier(stage);
 
-        if (flags & VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT) {
+        if (flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT) {
           // Fail if we have no idenfitier for whatever reason, caller
           // should fall back to the slow path if this happens
           if (!identifier->identifierSize)
@@ -1182,7 +1513,7 @@ namespace dxvk {
 
   VkPipeline DxvkShaderPipelineLibrary::compileVertexShaderPipeline(
     const DxvkShaderStageInfo&          stageInfo,
-          VkPipelineCreateFlags         flags) {
+          VkPipelineCreateFlags2        flags) {
     auto vk = m_device->vkd();
 
     // Set up dynamic state. We do not know any pipeline state
@@ -1236,18 +1567,23 @@ namespace dxvk {
     // Only the view mask is used as input, and since we do not use MultiView, it is always 0
     VkPipelineRenderingCreateInfo rtInfo = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
 
-    VkGraphicsPipelineLibraryCreateInfoEXT libInfo = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, &rtInfo };
+    VkPipelineCreateFlags2CreateInfo flagsInfo = { VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO, &rtInfo };
+    flagsInfo.flags = VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR | flags;
+
+    if (m_device->canUseDescriptorBuffer())
+      flagsInfo.flags |= VK_PIPELINE_CREATE_2_DESCRIPTOR_BUFFER_BIT_EXT;
+
+    VkGraphicsPipelineLibraryCreateInfoEXT libInfo = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, &flagsInfo };
     libInfo.flags             = VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT;
 
     VkGraphicsPipelineCreateInfo info = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &libInfo };
-    info.flags                = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | flags;
     info.stageCount           = stageInfo.getStageCount();
     info.pStages              = stageInfo.getStageInfos();
     info.pTessellationState   = m_shaders.tcs ? &tsInfo : nullptr;
     info.pViewportState       = &vpInfo;
     info.pRasterizationState  = &rsInfo;
     info.pDynamicState        = &dyInfo;
-    info.layout               = m_layout->getPipelineLayout(true);
+    info.layout               = m_layout.getLayout(DxvkPipelineLayoutType::Independent)->getPipelineLayout();
     info.basePipelineIndex    = -1;
 
     VkPipeline pipeline = VK_NULL_HANDLE;
@@ -1262,7 +1598,7 @@ namespace dxvk {
 
   VkPipeline DxvkShaderPipelineLibrary::compileFragmentShaderPipeline(
     const DxvkShaderStageInfo&          stageInfo,
-          VkPipelineCreateFlags         flags) {
+          VkPipelineCreateFlags2        flags) {
     auto vk = m_device->vkd();
 
     // Set up dynamic state. We do not know any pipeline state
@@ -1324,16 +1660,21 @@ namespace dxvk {
     // Only the view mask is used as input, and since we do not use MultiView, it is always 0
     VkPipelineRenderingCreateInfo rtInfo = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
 
-    VkGraphicsPipelineLibraryCreateInfoEXT libInfo = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, &rtInfo };
+    VkPipelineCreateFlags2CreateInfo flagsInfo = { VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO, &rtInfo };
+    flagsInfo.flags = VK_PIPELINE_CREATE_2_LIBRARY_BIT_KHR | flags;
+
+    if (m_device->canUseDescriptorBuffer())
+      flagsInfo.flags |= VK_PIPELINE_CREATE_2_DESCRIPTOR_BUFFER_BIT_EXT;
+
+    VkGraphicsPipelineLibraryCreateInfoEXT libInfo = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, &flagsInfo };
     libInfo.flags             = VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT;
 
     VkGraphicsPipelineCreateInfo info = { VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &libInfo };
-    info.flags                = VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | flags;
     info.stageCount           = stageInfo.getStageCount();
     info.pStages              = stageInfo.getStageInfos();
     info.pDepthStencilState   = &dsInfo;
     info.pDynamicState        = &dyInfo;
-    info.layout               = m_layout->getPipelineLayout(true);
+    info.layout               = m_layout.getLayout(DxvkPipelineLayoutType::Independent)->getPipelineLayout();
     info.basePipelineIndex    = -1;
 
     if (hasSampleRateShading)
@@ -1342,7 +1683,7 @@ namespace dxvk {
     VkPipeline pipeline = VK_NULL_HANDLE;
     VkResult vr = vk->vkCreateGraphicsPipelines(vk->device(), VK_NULL_HANDLE, 1, &info, nullptr, &pipeline);
 
-    if (vr && !(flags & VK_PIPELINE_CREATE_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT))
+    if (vr && !(flags & VK_PIPELINE_CREATE_2_FAIL_ON_PIPELINE_COMPILE_REQUIRED_BIT))
       Logger::err(str::format("DxvkShaderPipelineLibrary: Failed to create fragment shader pipeline: ", vr));
 
     return vr ? VK_NULL_HANDLE : pipeline;
@@ -1351,14 +1692,19 @@ namespace dxvk {
 
   VkPipeline DxvkShaderPipelineLibrary::compileComputeShaderPipeline(
     const DxvkShaderStageInfo&          stageInfo,
-          VkPipelineCreateFlags         flags) {
+          VkPipelineCreateFlags2        flags) {
     auto vk = m_device->vkd();
 
     // Compile the compute pipeline as normal
-    VkComputePipelineCreateInfo info = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO };
-    info.flags        = flags;
+    VkPipelineCreateFlags2CreateInfo flagsInfo = { VK_STRUCTURE_TYPE_PIPELINE_CREATE_FLAGS_2_CREATE_INFO };
+    flagsInfo.flags = flags;
+
+    if (m_device->canUseDescriptorBuffer())
+      flagsInfo.flags |= VK_PIPELINE_CREATE_2_DESCRIPTOR_BUFFER_BIT_EXT;
+
+    VkComputePipelineCreateInfo info = { VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO, &flagsInfo };
     info.stage        = *stageInfo.getStageInfos();
-    info.layout       = m_layout->getPipelineLayout(false);
+    info.layout       = m_layout.getLayout(DxvkPipelineLayoutType::Merged)->getPipelineLayout();
     info.basePipelineIndex = -1;
 
     VkPipeline pipeline = VK_NULL_HANDLE;
@@ -1381,7 +1727,11 @@ namespace dxvk {
     if (!shader)
       return SpirvCodeBuffer(dxvk_dummy_frag);
 
-    return shader->getCode(m_layout, DxvkShaderModuleCreateInfo());
+    DxvkPipelineLayoutType layoutType = stage == VK_SHADER_STAGE_COMPUTE_BIT
+      ? DxvkPipelineLayoutType::Merged
+      : DxvkPipelineLayoutType::Independent;
+
+    return shader->getCode(m_layout.getBindingMap(layoutType), DxvkShaderModuleCreateInfo());
   }
 
 

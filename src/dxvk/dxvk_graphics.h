@@ -9,14 +9,12 @@
 #include "dxvk_graphics_state.h"
 #include "dxvk_pipelayout.h"
 #include "dxvk_renderpass.h"
-#include "dxvk_resource.h"
 #include "dxvk_shader.h"
 #include "dxvk_stats.h"
 
 namespace dxvk {
   
   class DxvkDevice;
-  class DxvkStateCache;
   class DxvkPipelineManager;
   class DxvkPipelineWorkers;
 
@@ -32,6 +30,7 @@ namespace dxvk {
     HasStorageDescriptors,
     HasSampleRateShading,
     HasSampleMaskExport,
+    UnrollMergedDraws,
   };
 
   using DxvkGraphicsPipelineFlags = Flags<DxvkGraphicsPipelineFlag>;
@@ -50,7 +49,7 @@ namespace dxvk {
     DxvkGraphicsPipelineVertexInputState(
       const DxvkDevice*                     device,
       const DxvkGraphicsPipelineStateInfo&  state,
-      const DxvkShader*                     vs);
+      const DxvkGraphicsPipelineShaders&    shaders);
 
     VkPipelineInputAssemblyStateCreateInfo          iaInfo        = { VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO };
     VkPipelineVertexInputStateCreateInfo            viInfo        = { VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO };
@@ -109,7 +108,7 @@ namespace dxvk {
     DxvkGraphicsPipelineFragmentOutputState(
       const DxvkDevice*                     device,
       const DxvkGraphicsPipelineStateInfo&  state,
-      const DxvkShader*                     fs);
+      const DxvkGraphicsPipelineShaders&    shaders);
 
     VkPipelineRenderingCreateInfo                   rtInfo = { VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO };
     VkPipelineColorBlendStateCreateInfo             cbInfo = { VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO };
@@ -170,9 +169,7 @@ namespace dxvk {
     DxvkGraphicsPipelinePreRasterizationState(
       const DxvkDevice*                     device,
       const DxvkGraphicsPipelineStateInfo&  state,
-      const DxvkShader*                     tes,
-      const DxvkShader*                     gs,
-      const DxvkShader*                     fs);
+      const DxvkGraphicsPipelineShaders&    shaders);
 
     VkPipelineViewportStateCreateInfo                     vpInfo              = { VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO };
     VkPipelineTessellationStateCreateInfo                 tsInfo              = { VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO };
@@ -187,9 +184,8 @@ namespace dxvk {
     size_t hash() const;
 
     static bool isLineRendering(
-      const DxvkGraphicsPipelineStateInfo&  state,
-      const DxvkShader*                     tes,
-      const DxvkShader*                     gs);
+      const DxvkGraphicsPipelineShaders&    shaders,
+      const DxvkGraphicsPipelineStateInfo&  state);
 
   };
 
@@ -228,7 +224,7 @@ namespace dxvk {
             DxvkGraphicsPipelineFlags       flags);
 
     VkPipelineDynamicStateCreateInfo  dyInfo    = { VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO };
-    std::array<VkDynamicState, 12>    dyStates  = { };
+    std::array<VkDynamicState, 20>    dyStates  = { };
 
     bool eq(const DxvkGraphicsPipelineDynamicState& other) const;
 
@@ -349,6 +345,16 @@ namespace dxvk {
 
 
   /**
+   * \brief Graphics pipeline handle
+   */
+  struct DxvkGraphicsPipelineHandle {
+    VkPipeline                handle      = VK_NULL_HANDLE;
+    DxvkGraphicsPipelineType  type        = DxvkGraphicsPipelineType::FastPipeline;
+    DxvkAttachmentMask        attachments = { };
+  };
+
+
+  /**
    * \brief Graphics pipeline instance
    * 
    * Stores a state vector and the
@@ -359,16 +365,35 @@ namespace dxvk {
     DxvkGraphicsPipelineInstance(
       const DxvkGraphicsPipelineStateInfo&  state_,
             VkPipeline                      baseHandle_,
-            VkPipeline                      fastHandle_)
+            VkPipeline                      fastHandle_,
+            DxvkAttachmentMask              attachments_)
     : state       (state_),
       baseHandle  (baseHandle_),
       fastHandle  (fastHandle_),
-      isCompiling (fastHandle_ != VK_NULL_HANDLE) { }
+      isCompiling (fastHandle_ != VK_NULL_HANDLE),
+      attachments (attachments_) { }
 
     DxvkGraphicsPipelineStateInfo state;
     std::atomic<VkPipeline>       baseHandle  = { VK_NULL_HANDLE };
     std::atomic<VkPipeline>       fastHandle  = { VK_NULL_HANDLE };
     std::atomic<VkBool32>         isCompiling = { VK_FALSE };
+    DxvkAttachmentMask            attachments = { };
+
+    DxvkGraphicsPipelineHandle getHandle() const {
+      // Find a pipeline handle to use. If no optimized pipeline has
+      // been compiled yet, use the slower base pipeline instead.
+      DxvkGraphicsPipelineHandle result;
+      result.handle = fastHandle.load(std::memory_order_acquire);
+      result.type = DxvkGraphicsPipelineType::FastPipeline;
+      result.attachments = attachments;
+
+      if (likely(fastHandle))
+        return result;
+
+      result.handle = baseHandle.load(std::memory_order_acquire);
+      result.type = DxvkGraphicsPipelineType::BasePipeline;
+      return result;
+    }
   };
 
 
@@ -413,10 +438,10 @@ namespace dxvk {
             uint32_t                          specConstantMask)
     : shState(shaders, state),
       dyState(device, state, flags),
-      viState(device, state, shaders.vs.ptr()),
-      prState(device, state, shaders.tes.ptr(), shaders.gs.ptr(), shaders.fs.ptr()),
+      viState(device, state, shaders),
+      prState(device, state, shaders),
       fsState(device, state),
-      foState(device, state, shaders.fs.ptr()),
+      foState(device, state, shaders),
       scState(specConstantMask, state.sc) { }
 
     DxvkGraphicsPipelineShaderState           shState;
@@ -466,7 +491,6 @@ namespace dxvk {
             DxvkDevice*                 device,
             DxvkPipelineManager*        pipeMgr,
             DxvkGraphicsPipelineShaders shaders,
-            DxvkBindingLayoutObjects*   layout,
             DxvkShaderPipelineLibrary*  vsLibrary,
             DxvkShaderPipelineLibrary*  fsLibrary);
 
@@ -489,15 +513,11 @@ namespace dxvk {
     }
     
     /**
-     * \brief Pipeline layout
-     * 
-     * Stores the pipeline layout and the descriptor set
-     * layout, as well as information on the resource
-     * slots used by the pipeline.
+     * \brief Queries pipeline layout
      * \returns Pipeline layout
      */
-    DxvkBindingLayoutObjects* getBindings() const {
-      return m_bindings;
+    const DxvkPipelineBindings* getLayout() const {
+      return &m_layout;
     }
 
     /**
@@ -532,7 +552,7 @@ namespace dxvk {
      * \param [in] state Pipeline state vector
      * \returns Pipeline handle and handle type
      */
-    std::pair<VkPipeline, DxvkGraphicsPipelineType> getPipelineHandle(
+    DxvkGraphicsPipelineHandle getPipelineHandle(
       const DxvkGraphicsPipelineStateInfo&    state);
     
     /**
@@ -562,16 +582,26 @@ namespace dxvk {
      */
     void releasePipeline();
 
+    /**
+     * \brief Queries debug name for the pipeline
+     *
+     * The pipeline debug name contains the debug name of
+     * each shader included in the pipeline.
+     * \returns Pipeline debug name
+     */
+    const char* debugName() const {
+      return m_debugName.c_str();
+    }
+
   private:
 
     DxvkDevice*                 m_device;    
     DxvkPipelineManager*        m_manager;
     DxvkPipelineWorkers*        m_workers;
-    DxvkStateCache*             m_stateCache;
     DxvkPipelineStats*          m_stats;
 
     DxvkGraphicsPipelineShaders m_shaders;
-    DxvkBindingLayoutObjects*   m_bindings;
+    DxvkPipelineBindings        m_layout;
     DxvkGlobalPipelineBarrier   m_barrier;
     DxvkGraphicsPipelineFlags   m_flags;
 
@@ -582,6 +612,8 @@ namespace dxvk {
     uint32_t m_fsOut = 0;
 
     uint32_t m_specConstantMask = 0;
+
+    std::string m_debugName;
 
     alignas(CACHE_LINE_SIZE)
     dxvk::mutex                                   m_mutex;
@@ -597,7 +629,7 @@ namespace dxvk {
     std::unordered_map<
       DxvkGraphicsPipelineFastInstanceKey,
       VkPipeline, DxvkHash, DxvkEq>               m_fastPipelines;
-    
+
     DxvkGraphicsPipelineInstance* createInstance(
       const DxvkGraphicsPipelineStateInfo& state,
             bool                           doCreateBasePipeline);
@@ -633,16 +665,20 @@ namespace dxvk {
     
     uint32_t computeSpecConstantMask() const;
 
+    DxvkAttachmentMask computeAttachmentMask(
+      const DxvkGraphicsPipelineStateInfo& state) const;
+
     bool validatePipelineState(
       const DxvkGraphicsPipelineStateInfo& state,
             bool                           trusted) const;
-    
-    void writePipelineStateToCache(
-      const DxvkGraphicsPipelineStateInfo& state) const;
-    
+
+    DxvkPipelineLayoutBuilder buildPipelineLayout() const;
+
     void logPipelineState(
             LogLevel                       level,
       const DxvkGraphicsPipelineStateInfo& state) const;
+
+    std::string createDebugName() const;
 
   };
   

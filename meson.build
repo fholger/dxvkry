@@ -1,4 +1,4 @@
-project('dxvk', ['c', 'cpp'], version : 'v2.4.1', meson_version : '>= 0.58', default_options : [ 'cpp_std=c++17', 'warning_level=2' ])
+project('dxvk', ['c', 'cpp'], version : '2.7', meson_version : '>= 0.58', default_options : [ 'cpp_std=c++17', 'b_vscrt=static_from_buildtype', 'warning_level=2' ])
 
 pkg = import('pkgconfig')
 cpu_family = target_machine.cpu_family()
@@ -18,6 +18,7 @@ compiler_args = [
   # gcc
   '-Wno-missing-field-initializers',
   '-Wno-unused-parameter',
+  '-Wno-misleading-indentation',
   '-Wno-cast-function-type', # Needed for GetProcAddress.
   # clang
   '-Wno-unused-private-field',
@@ -79,28 +80,32 @@ if platform == 'windows'
       ]
     endif
 
-    # Enable stdcall fixup on 32-bit
     if cpu_family == 'x86'
+      # Enable stdcall fixup on 32-bit
       link_args += [
         '-Wl,--enable-stdcall-fixup',
         '-Wl,--kill-at',
       ]
+      # Fix stack alignment issues with mingw on 32-bit
+      compiler_args += [
+        '-mpreferred-stack-boundary=2'
+      ]
     endif
   else
+    # setup file alignment + enable PDB output for MSVC builds
+    # PDBs are useful for Windows consumers of DXVK 
+    compiler_args += [
+      '/Z7'
+    ]
     link_args += [
       '/FILEALIGN:4096',
+      '/DEBUG:FULL'
     ]
   endif
 
   lib_d3d9    = cpp.find_library('d3d9')
   lib_d3d11   = cpp.find_library('d3d11')
   lib_dxgi    = cpp.find_library('dxgi')
-
-  if dxvk_is_msvc
-    lib_d3dcompiler_47 = cpp.find_library('d3dcompiler')
-  else
-    lib_d3dcompiler_47 = cpp.find_library('d3dcompiler_47')
-  endif
 
   if dxvk_is_msvc
     res_ext = '.res'
@@ -142,16 +147,20 @@ else
     './include/native/directx'
   ]
 
-  lib_sdl2 = dependency('SDL2', required: false)
-  lib_glfw = dependency('glfw', required: false)
+  lib_sdl3 = dependency('sdl3', required: get_option('native_sdl3'))
+  lib_sdl2 = dependency('sdl2', required: get_option('native_sdl2'))
+  lib_glfw = dependency('glfw', required: get_option('native_glfw'))
+  if lib_sdl3.found()
+    compiler_args += ['-DDXVK_WSI_SDL3']
+  endif
   if lib_sdl2.found()
     compiler_args += ['-DDXVK_WSI_SDL2']
   endif
   if lib_glfw.found()
     compiler_args += ['-DDXVK_WSI_GLFW']
   endif
-  if (not lib_sdl2.found() and not lib_glfw.found())
-    error('SDL2 or GLFW are required to build dxvk-native')
+  if (not lib_sdl3.found() and not lib_sdl2.found() and not lib_glfw.found())
+    error('SDL3, SDL2, or GLFW are required to build dxvk-native')
   endif
   
   dxvk_name_prefix = 'dxvk_'
@@ -193,6 +202,16 @@ dxvk_version = vcs_tag(
   command: ['git', 'describe', '--dirty=+'],
   input:  'version.h.in',
   output: 'version.h',
+)
+
+conf_data = configuration_data()
+conf_data.set('BUILD_COMPILER', cpp.get_id())
+conf_data.set('BUILD_COMPILER_VERSION', cpp.version())
+conf_data.set('BUILD_TARGET', cpu_family)
+dxvk_buildenv = configure_file(
+  configuration : conf_data,
+  input:  'buildenv.h.in',
+  output: 'buildenv.h',
 )
 
 if platform != 'windows'
